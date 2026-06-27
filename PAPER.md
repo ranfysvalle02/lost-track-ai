@@ -176,22 +176,32 @@ The paper's headline is a **dissociation across architectures**: as attention to
 closes, the residual stream may still encode the goal (high probe AUC) while *behavior* either
 holds (the model reads from the residual stream) or collapses (it cannot, despite the info
 being present). `demo.py compare` builds this 2-axis signature per logged model — residual
-decodability (`best_residual_auc_by_model`) against behavioral survival under closure
-(`ablated_ok/normal_ok`) — and buckets each model via `classify_reliance`:
+decodability (`best_residual_auc_by_model`) against **graded-closure survival**
+(`closure_survival_by_model`) — and buckets each model via `classify_reliance`:
 
-- `residual-reliant`  — goal decodable AND recall survives closure (robust).
+- `residual-reliant`  — goal decodable AND recall survives graded closure (robust).
 - `attention-reliant` — goal decodable BUT recall collapses under closure (the dissociation).
 - `weak-encoding`     — goal not decodable from the residual stream.
 
-Measured across three ungated small models (Qwen2.5-0.5B-Instruct, SmolLM2-360M-Instruct,
-TinyLlama-1.1B-Chat-v1.0), **all three landed in `attention-reliant`** (residual AUC ~0.99–1.0,
-ablation survival 0.00). So the demo reproduces the paper's *method and per-model signature* but
-**not the architectural divergence** itself — small instruct models behave alike here, and
-showing a genuine contrast would need larger, deliberately chosen families plus statistical
-treatment. The honest negative is the result; the harness is the deliverable.
+The survival axis matters: an earlier version computed it from *total* ablation
+(`ablated_ok/normal_ok`), which masks the entire system span and therefore pins recall at 0 for
+every model — the axis could never discriminate. The demo now uses a **graded closure**: it
+hides a growing suffix of the system prompt (`build_partial_ablation_mask`, keeping the first
+75% / 50% / 25% visible) so some fact lines stay attendable while others survive only in the
+residual stream, and `survival` is the mean recall over those partial closures — a value that
+genuinely lands in [0, 1].
+
+Measured across three ungated small models, the survival axis is now real and differentiated —
+SmolLM2-360M 0.08, Qwen2.5-0.5B 0.17, TinyLlama-1.1B 0.17 — but **all three still fall below the
+survival threshold and land in `attention-reliant`** (residual AUC ~0.99–1.0). So the demo
+reproduces the paper's *method and per-model signature*, and the dissociation axis now
+discriminates rather than being degenerate, but it does **not** reproduce the architectural
+*divergence* itself: flipping a model to `residual-reliant` would need larger, deliberately
+chosen families plus statistical treatment. The honest negative is the result; the harness is
+the deliverable.
 
 (Note: to keep `eager`-attention prefill in memory, the added models are run with a capped GAR
-sweep via `--max-turns`; this does not affect the ablation/probe axes that drive the reliance
+sweep via `--max-turns`; this does not affect the closure/probe axes that drive the reliance
 call.)
 
 ---
@@ -206,7 +216,7 @@ call.)
 | Goal information survives in the residual stream (high AUC) | Yes | residual AUC 0.990 / 1.000 |
 | Input embeddings stay at chance | Yes | embedding AUC 0.500 |
 | Encoding emerges at some depth (layers 2–27) | Partially | layer 2 = 0.500, layers 12/22 ≈ 0.99 on this model |
-| Cross-architecture *divergence* ("what survives reveals architecture") | Attempted, not observed | `compare` across 3 small models: all `attention-reliant` (residual AUC ~0.99–1.0, ablation survival 0.00) — no contrast at this scale |
+| Cross-architecture *divergence* ("what survives reveals architecture") | Attempted, not observed | `compare` across 3 small models: graded-closure survival differs (0.08 / 0.17 / 0.17) but all stay `attention-reliant` (residual AUC ~0.99–1.0) — no flip at this scale |
 
 ---
 
@@ -218,16 +228,18 @@ These parts of the paper are out of scope here:
 - **Cross-architecture *divergence* (attempted, not reproduced).** The paper's central
   narrative — "what survives reveals architecture," with some models preserving behavior at
   vanishing attention and others failing despite decodable residual info — requires multiple
-  model families. The demo now *attempts* this descriptively via `compare` (see below): it
-  lines up each model's signature and buckets it. Across three small ungated models
-  (Qwen2.5-0.5B, SmolLM2-360M, TinyLlama-1.1B) all three came out `attention-reliant`, so the
-  contrast the paper reports did **not** appear at this scale — which is reported as-is rather
-  than massaged into a divergence.
+  model families. The demo now *attempts* this descriptively via `compare` (see below) on a
+  graded-closure survival axis that genuinely discriminates (SmolLM2-360M 0.08 vs Qwen2.5-0.5B
+  / TinyLlama-1.1B 0.17). But all three still stay below the survival threshold and bucket as
+  `attention-reliant`, so the *flip* the paper reports — a model crossing into
+  `residual-reliant` — did **not** appear at this scale, which is reported as-is rather than
+  massaged into a divergence.
 - **Parametric failure-timing / crossover-turn prediction.** The paper predicts *when* a
   model will fail under windowed attention closure. The demo shows decay and collapse but
   does not fit or validate a timing model.
-- **True sliding-window ablation.** The demo uses a simpler whole-span column mask rather than
-  a moving window over turns.
+- **True sliding-window ablation.** The demo closes the channel with a whole-span column mask
+  (total closure) and a graded suffix mask (partial closure of the system prompt), rather than
+  a moving window that slides over turns as context grows.
 - **Persona-constraint violations and the adversarial-pressure baseline.** The demo grades
   exact fact recall only; it does not measure persona drift or compare against an adversarial
   baseline.

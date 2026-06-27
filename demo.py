@@ -344,10 +344,16 @@ def run_gar(m: "Model", coll=None, run: dict | None = None,
     print("(early = first third of layers, late = last third.)\n")
 
 
+# Fractions of the system span left visible to post-system tokens in the graded closure
+# sweep. 1.0 == full baseline; lower values hide more of the goal. Survival is measured over
+# the partial closures (fraction < 1.0); total closure (0.0) is the separate MODE-2 baseline.
+CLOSURE_KEEP_FRACTIONS = (1.0, 0.75, 0.5, 0.25)
+
+
 def run_ablate(m: "Model", coll=None, run: dict | None = None) -> None:
     run = run or {}
     print("\n" + "=" * 72)
-    print("  MODE 2: Ablation — force-close attention to system tokens, recall collapses")
+    print("  MODE 2: Ablation — close attention to system tokens, totally then gradually")
     print("=" * 72)
 
     # Use a modest context where normal recall is clean, so any collapse is
@@ -356,8 +362,9 @@ def run_ablate(m: "Model", coll=None, run: dict | None = None) -> None:
     sys_span = m.system_span(msgs)
 
     normal_hits, ablated_hits = 0, 0
-    print(f"{'fact':>20} | {'normal':>8} | {'ablated':>8}")
-    print("-" * 72)
+    print("  total closure (channel from every generated token to the system span):")
+    print(f"    {'fact':>20} | {'normal':>8} | {'ablated':>8}")
+    print("    " + "-" * 44)
     for fact_name, question in PROBES:
         probe_msgs = msgs + [{"role": "user", "content": question}]
         ids = m.encode(probe_msgs)
@@ -373,13 +380,46 @@ def run_ablate(m: "Model", coll=None, run: dict | None = None) -> None:
             "mode": "ablate", "fact": fact_name,
             "normal_ok": int(n_ok), "ablated_ok": int(a_ok),
         })
-        print(f"{fact_name:>20} | {'OK' if n_ok else 'MISS':>8} | {'OK' if a_ok else 'MISS':>8}")
+        print(f"    {fact_name:>20} | {'OK' if n_ok else 'MISS':>8} | "
+              f"{'OK' if a_ok else 'MISS':>8}")
 
     n = len(PROBES)
-    print("-" * 72)
-    print(f"recall: normal {normal_hits}/{n} ({100*normal_hits/n:.0f}%)  ->  "
+    print("    " + "-" * 44)
+    print(f"    recall: normal {normal_hits}/{n} ({100*normal_hits/n:.0f}%)  ->  "
           f"ablated {ablated_hits}/{n} ({100*ablated_hits/n:.0f}%)")
-    print("Blinding the model to its own system prompt collapses fact recall.\n")
+
+    # Graded closure: hide a growing suffix of the system span. Facts that stay visible are
+    # recalled via attention; hidden facts can only be recovered from the residual stream —
+    # so recall here separates residual-reliant models (recall persists) from attention-
+    # reliant ones (recall collapses), and lands between full and zero.
+    sys_len = sys_span.stop - sys_span.start
+    print("\n  graded closure (keep the first frac of the system prompt visible):")
+    print(f"    {'visible':>8} | {'sys masked':>10} | {'recall':>6}")
+    print("    " + "-" * 32)
+    closing_hits = closing_total = 0
+    for frac in CLOSURE_KEEP_FRACTIONS:
+        hits = 0
+        masked = sys_len - round(frac * sys_len)
+        for fact_name, question in PROBES:
+            ids = m.encode(msgs + [{"role": "user", "content": question}])
+            reply = generate_partial_ablated(m, ids, sys_span, frac, max_new_tokens=30)
+            ok = FACTS[fact_name].lower() in reply.lower()
+            hits += ok
+            log_metric(coll, run, {
+                "mode": "closure", "fact": fact_name, "frac": frac,
+                "sys_masked": masked, "sys_len": sys_len, "recall_ok": int(ok),
+            })
+        if frac < 1.0:
+            closing_hits += hits
+            closing_total += len(PROBES)
+        print(f"    {frac:>8.2f} | {masked:>10} | {hits:>4}/{len(PROBES)}")
+
+    survival = closing_hits / closing_total if closing_total else 0.0
+    print("    " + "-" * 32)
+    print(f"  survival under partial closure: {survival:.2f} "
+          f"({closing_hits}/{closing_total} recalled). Total closure collapses recall; how "
+          "much\n  survives the *graded* closure is what separates architectures (see "
+          "`compare`).\n")
 
 
 def build_ablation_mask(L: int, sys_span: slice, device=None) -> torch.Tensor:
@@ -414,6 +454,48 @@ def generate_ablated(m: "Model", ids: torch.Tensor, sys_span: slice,
                 "non-finite logits under the ablation mask — an attention row was fully "
                 "masked (-inf). Check build_ablation_mask."
             )
+        nxt = logits[0, -1].argmax().item()
+        if nxt == m.tok.eos_token_id:
+            break
+        cur = torch.cat([cur, torch.tensor([[nxt]], device=DEVICE)], dim=1)
+    return m.tok.decode(cur[0, ids.shape[1]:], skip_special_tokens=True)
+
+
+def build_partial_ablation_mask(L: int, sys_span: slice, keep_frac: float,
+                                device=None) -> torch.Tensor:
+    """Additive (1, 1, L, L) mask that *partially* closes the channel from post-system
+    tokens to the system span: it keeps the first `keep_frac` of the system-token columns
+    visible and masks the rest. This is the graded generalization of `build_ablation_mask`:
+
+      - keep_frac == 1.0 -> mask nothing (plain causal baseline)
+      - keep_frac == 0.0 -> mask the whole span (== build_ablation_mask, total closure)
+
+    Because the goal facts sit on separate lines in the system prompt, hiding a suffix of
+    the span leaves some facts attendable while others can only be recovered from the
+    residual stream — so recall here lands *between* full and zero, and how much survives
+    separates residual-reliant models from attention-reliant ones. Only post-system rows are
+    masked, so every row keeps its causal diagonal (no all -inf row, no softmax NaN)."""
+    mask = torch.full((L, L), NEG, device=device).triu(1)
+    span = list(range(sys_span.start, sys_span.stop))
+    keep_n = round(keep_frac * len(span))
+    masked_cols = span[keep_n:]
+    if masked_cols:
+        mask[sys_span.stop:, masked_cols] = NEG
+    return mask.view(1, 1, L, L)
+
+
+@torch.no_grad()
+def generate_partial_ablated(m: "Model", ids: torch.Tensor, sys_span: slice,
+                             keep_frac: float, max_new_tokens: int = 30) -> str:
+    """Greedy-generate while keeping only the first `keep_frac` of the system span visible to
+    post-system tokens at every step (see `build_partial_ablation_mask`)."""
+    cur = ids
+    for _ in range(max_new_tokens):
+        L = cur.shape[1]
+        mask = build_partial_ablation_mask(L, sys_span, keep_frac, device=DEVICE)
+        logits = m.model(cur, attention_mask=mask).logits
+        if not torch.isfinite(logits[0, -1]).all():
+            raise RuntimeError("non-finite logits under the partial-ablation mask.")
         nxt = logits[0, -1].argmax().item()
         if nxt == m.tok.eos_token_id:
             break
@@ -566,6 +648,20 @@ def best_residual_auc_by_model(coll, match: dict | None = None) -> list[dict]:
     ]))
 
 
+def closure_survival_by_model(coll, match: dict | None = None) -> list[dict]:
+    """Behavioral survival under the *graded* (partial) closure, per model: the mean recall
+    over the partial closures (fraction < 1.0, i.e. excluding the full-attention baseline).
+    This is the dissociation axis — a residual-reliant model keeps recalling as more of the
+    system prompt is hidden, an attention-reliant one collapses. Unlike total ablation (which
+    pins recall at 0 for everyone), this lands between 0 and 1."""
+    return list(coll.aggregate([
+        {"$match": {"mode": "closure", "frac": {"$lt": 1.0}, **(match or {})}},
+        {"$group": {"_id": "$model", "survival": {"$avg": "$recall_ok"},
+                    "steps": {"$sum": 1}}},
+        {"$sort": {"_id": 1}},
+    ]))
+
+
 # Thresholds for the cross-architecture reliance call. Deliberately lenient and named so the
 # heuristic is explicit: "decodable" = the goal is recoverable from the residual stream at all;
 # "survives" = at least half of recall holds when the attention channel is force-closed.
@@ -599,17 +695,23 @@ def compare_by_model(coll, match: dict | None = None) -> list[dict]:
     for r in best_residual_auc_by_model(coll, match):
         auc.setdefault(r["_id"]["model"], {})[r["_id"]["repr"]] = r["best_auc"]
     ablate = {r["_id"]: r for r in ablation_rate_by_model(coll, match)}
+    closure = {r["_id"]: r for r in closure_survival_by_model(coll, match)}
     cross = {r["_id"]: r for r in crossover_by_model(coll, match)}
     gar = {r["_id"]: r for r in gar_range_by_model(coll, match)}
 
-    models = sorted(set(auc) | set(ablate) | set(cross) | set(gar))
+    models = sorted(set(auc) | set(ablate) | set(closure) | set(cross) | set(gar))
     rows = []
     for name in models:
         a = ablate.get(name)
         normal_ok = a["normal_ok"] if a else 0
         ablated_ok = a["ablated_ok"] if a else 0
         facts = (a["facts"] if a else 0) or 0
-        survival = ablated_ok / normal_ok if normal_ok else None
+        # Prefer the graded partial-closure survival (lands in [0,1]); fall back to the
+        # total-ablation ratio only when no graded sweep was logged.
+        if name in closure:
+            survival = closure[name]["survival"]
+        else:
+            survival = ablated_ok / normal_ok if normal_ok else None
         residual_auc = auc.get(name, {}).get("residual")
         rows.append({
             "model": name,
@@ -703,9 +805,9 @@ def run_report(coll, scope: str = "latest", run_id: str | None = None) -> None:
 
 def run_compare(coll, scope: str = "latest", run_id: str | None = None) -> None:
     """Cross-architecture view: line up each model's *dissociation signature* — does the goal
-    survive in the residual stream (probe AUC), and does behavior survive when the attention
-    channel to the goal is force-closed (ablation survival)? The paper's headline is that these
-    two can come apart differently by architecture. This is descriptive, not a replication."""
+    survive in the residual stream (probe AUC), and does behavior survive as the attention
+    channel to the goal is progressively closed (graded closure survival)? The paper's headline
+    is that these two can come apart differently by architecture. Descriptive, not a replication."""
     print("\n" + "=" * 72)
     print("  COMPARE: cross-architecture dissociation (residual survival vs behavior)")
     print("=" * 72)
@@ -736,14 +838,17 @@ def run_compare(coll, scope: str = "latest", run_id: str | None = None) -> None:
               f"{str(miss):>6} | {r['reliance']:>17}")
 
     print("\n  Reading it:")
-    print("    - residual-reliant : goal decodable AND recall survives closure (robust).")
+    print("    - ablat = recall under TOTAL closure (system span fully blinded; ~0 by design).")
+    print("    - surv  = recall under GRADED closure (mean recall as more of the system prompt")
+    print("              is hidden) — the discriminating axis, since it lands anywhere in [0, 1].")
+    print("    - residual-reliant : goal decodable AND recall survives graded closure (robust).")
     print("    - attention-reliant: goal decodable BUT recall collapses under closure")
     print("                         (info present, unused without attention — the dissociation).")
     print("    - weak-encoding    : goal not decodable from the residual stream.")
 
     if len(rows) < 2:
         print("\n  Only one model in scope — log another with `demo.py all --model <name>`")
-        print("  (e.g. SmolLM2-1.7B-Instruct, TinyLlama-1.1B-Chat-v1.0) to see a contrast.")
+        print("  (e.g. SmolLM2-360M-Instruct, TinyLlama-1.1B-Chat-v1.0) to see a contrast.")
 
     print("\n  Caveat: small instruct models, a single run each, 4 planted facts and a 32-sample")
     print("  probe. This shows the *shape* of the dissociation, not the paper's statistically")

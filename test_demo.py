@@ -28,6 +28,7 @@ from demo import (
     GAR_SCHEDULE,
     NEG,
     build_ablation_mask,
+    build_partial_ablation_mask,
     classify_reliance,
     compare_by_model,
     crossover_by_model,
@@ -103,6 +104,28 @@ def test_ablation_mask_has_no_all_inf_rows() -> None:
     # Each row's probabilities should sum to 1 (no degenerate NaN row).
     sums = attn.sum(dim=-1)
     assert torch.allclose(sums, torch.ones_like(sums), atol=1e-5), sums
+
+
+def test_partial_ablation_mask_grades_between_baseline_and_total() -> None:
+    L, sys_span = 8, slice(0, 4)  # system span = cols 0..3, post-system rows = 4..7
+
+    # keep_frac == 1.0 -> nothing masked beyond causal (plain causal baseline).
+    full = build_partial_ablation_mask(L, sys_span, 1.0)[0, 0]
+    causal = torch.full((L, L), NEG).triu(1)
+    assert torch.equal(full, causal)
+
+    # keep_frac == 0.0 -> the whole span masked from post-system rows (== total ablation).
+    total = build_partial_ablation_mask(L, sys_span, 0.0)[0, 0]
+    assert torch.equal(total, build_ablation_mask(L, sys_span)[0, 0])
+
+    # keep_frac == 0.5 -> keep the first 2 span cols, mask cols 2,3 for post-system rows.
+    half = build_partial_ablation_mask(L, sys_span, 0.5)[0, 0]
+    for i in range(sys_span.stop, L):
+        assert half[i, 0].item() == 0.0 and half[i, 1].item() == 0.0, i  # kept
+        assert half[i, 2].item() == NEG and half[i, 3].item() == NEG, i  # masked
+        assert half[i, i].item() != NEG, i                               # diagonal kept
+    # No fully -inf row -> softmax stays finite.
+    assert torch.isfinite(torch.softmax(half, dim=-1)).all()
 
 
 def test_crossover_by_model_aggregation() -> None:
@@ -204,26 +227,37 @@ def test_classify_reliance_buckets() -> None:
 
 def test_compare_dissociation() -> None:
     # Two synthetic models with identical residual decodability but opposite behavior under
-    # attention closure: R keeps recall (residual-reliant), F collapses (attention-reliant).
+    # the graded (partial) closure: R keeps recall as more of the system prompt is hidden
+    # (residual-reliant), F collapses (attention-reliant). Total ablation is 0 for both (by
+    # design), so the dissociation must come from the graded closure-survival axis.
     tmp = tempfile.mkdtemp()
     try:
         coll = open_metrics("local://" + os.path.join(tmp, "db"))
         docs = []
-        for model, ablated_ok in (("R", 1), ("F", 0)):
-            # Probe: residual highly decodable, embedding at chance.
+        for model, closing_ok in (("R", 1), ("F", 0)):
             docs.append({"model": model, "mode": "probe", "repr": "residual", "auc": 0.99})
             docs.append({"model": model, "mode": "probe", "repr": "embedding", "auc": 0.50})
-            # Ablation: both recall all 4 facts normally; only R survives closure.
             for fact in ("a", "b", "c", "d"):
+                # Total closure collapses recall for both.
                 docs.append({"model": model, "mode": "ablate", "fact": fact,
-                             "normal_ok": 1, "ablated_ok": ablated_ok})
+                             "normal_ok": 1, "ablated_ok": 0})
+                # Graded closure: the full baseline recalls; partial closures separate the
+                # two models. frac == 1.0 must be excluded from survival.
+                docs.append({"model": model, "mode": "closure", "fact": fact,
+                             "frac": 1.0, "recall_ok": 1})
+                for frac in (0.75, 0.5, 0.25):
+                    docs.append({"model": model, "mode": "closure", "fact": fact,
+                                 "frac": frac, "recall_ok": closing_ok})
         coll.insert_many(docs)
 
         rows = {r["model"]: r for r in compare_by_model(coll)}
         assert set(rows) == {"R", "F"}, rows
         assert abs(rows["R"]["residual_auc"] - 0.99) < 1e-9
+        # Survival is the mean recall over the partial closures (frac < 1.0), not the baseline.
         assert rows["R"]["survival"] == 1.0, rows["R"]
         assert rows["F"]["survival"] == 0.0, rows["F"]
+        # Total-ablation rate stays 0 for both (the old, degenerate axis).
+        assert rows["R"]["ablated_rate"] == 0.0, rows["R"]
         assert rows["R"]["reliance"] == "residual-reliant", rows["R"]
         assert rows["F"]["reliance"] == "attention-reliant", rows["F"]
     finally:

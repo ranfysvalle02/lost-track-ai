@@ -30,17 +30,28 @@ at longer context) — MODE 2 forces the clean *causal* collapse via ablation.
 
 
 ========================================================================
-  MODE 2: Ablation — force-close attention to system tokens, recall collapses
+  MODE 2: Ablation — close attention to system tokens, totally then gradually
 ========================================================================
-                fact |   normal |  ablated
-------------------------------------------------------------------------
-    project codename |       OK |     MISS
-        lead auditor |       OK |     MISS
-compliance framework |       OK |     MISS
-      launch quarter |       OK |     MISS
-------------------------------------------------------------------------
-recall: normal 4/4 (100%)  ->  ablated 0/4 (0%)
-Blinding the model to its own system prompt collapses fact recall.
+  total closure (channel from every generated token to the system span):
+                    fact |   normal |  ablated
+    --------------------------------------------
+        project codename |       OK |     MISS
+            lead auditor |       OK |     MISS
+    compliance framework |       OK |     MISS
+          launch quarter |       OK |     MISS
+    --------------------------------------------
+    recall: normal 4/4 (100%)  ->  ablated 0/4 (0%)
+
+  graded closure (keep the first frac of the system prompt visible):
+     visible | sys masked | recall
+    --------------------------------
+        1.00 |          0 |    4/4
+        0.75 |         22 |    2/4
+        0.50 |         44 |    0/4
+        0.25 |         66 |    0/4
+    --------------------------------
+  survival under partial closure: 0.17 (2/12 recalled). Total closure collapses recall; how much
+  survives the *graded* closure is what separates architectures (see `compare`).
 
 
 ========================================================================
@@ -113,12 +124,15 @@ signature. Captured across three ungated small models:
 
                      model | res AUC | emb AUC | normal |  ablat |  surv |  miss@ |          reliance
   ----------------------------------------------------------------------------------------------------
-     SmolLM2-360M-Instruct |   0.990 |   0.500 |   1.00 |   0.00 |  0.00 |      0 | attention-reliant
-     Qwen2.5-0.5B-Instruct |   1.000 |   0.500 |   1.00 |   0.00 |  0.00 |    128 | attention-reliant
-  TinyLlama-1.1B-Chat-v1.0 |   1.000 |   0.500 |   1.00 |   0.00 |  0.00 |      0 | attention-reliant
+     SmolLM2-360M-Instruct |   0.990 |   0.500 |   1.00 |   0.00 |  0.08 |      0 | attention-reliant
+     Qwen2.5-0.5B-Instruct |   1.000 |   0.500 |   1.00 |   0.00 |  0.17 |    128 | attention-reliant
+  TinyLlama-1.1B-Chat-v1.0 |   1.000 |   0.500 |   1.00 |   0.00 |  0.17 |      0 | attention-reliant
 
   Reading it:
-    - residual-reliant : goal decodable AND recall survives closure (robust).
+    - ablat = recall under TOTAL closure (system span fully blinded; ~0 by design).
+    - surv  = recall under GRADED closure (mean recall as more of the system prompt
+              is hidden) — the discriminating axis, since it lands anywhere in [0, 1].
+    - residual-reliant : goal decodable AND recall survives graded closure (robust).
     - attention-reliant: goal decodable BUT recall collapses under closure
                          (info present, unused without attention — the dissociation).
     - weak-encoding    : goal not decodable from the residual stream.
@@ -128,12 +142,16 @@ signature. Captured across three ungated small models:
   treated cross-architecture result.
 ```
 
-**Honest result:** all three small models are `attention-reliant` — the goal is decodable from
-the residual stream (AUC ~0.99–1.0) yet recall collapses when attention to it is closed. The
-harness produces the per-model signature and the dissociation buckets correctly, but the
-architectural *divergence* the paper reports does not appear at this scale. That negative is
-reported as-is. (The added models use a capped GAR sweep via `--max-turns 24` so eager-attention
-prefill stays in memory; the reliance call is driven by the ablation/probe axes, not sweep
+**Honest result:** the graded-closure survival is now a real, differentiated axis
+(SmolLM2-360M `0.08`, Qwen2.5-0.5B and TinyLlama-1.1B `0.17`) rather than being pinned at 0 by
+total ablation — yet all three still sit below the survival threshold and bucket as
+`attention-reliant`: the goal is decodable from the residual stream (AUC ~0.99–1.0) but recall
+falls away as attention to it is closed. The harness produces the per-model signature and the
+dissociation buckets correctly, and the survival axis genuinely discriminates, but no model
+*flips* into `residual-reliant`, so the architectural *divergence* the paper reports does not
+appear at this scale. That negative is reported as-is. (The added models use a capped GAR sweep
+via `--max-turns 24` so eager-attention prefill stays in memory; the reliance call is driven by
+the closure/probe axes, not sweep
 depth.)
 
 ## How to read it
@@ -147,10 +165,11 @@ depth.)
   which is why MODE 2 induces it causally. GAR here is measured memory-safely at the final
   token (`Model.gar_last_token`), so the sweep can reach multi-thousand-token context
   without materializing O(L^2) attention across all layers.
-- **Ablation.** With normal attention the model recalls every fact (4/4). Closing the
-  channel from generated tokens to the system span drops recall to 0/4 — and the run
-  completes with no NaN (the finite-logits guard in `generate_ablated` passed), so the
-  collapse is the manipulation, not a numerical artifact.
+- **Ablation.** With normal attention the model recalls every fact (4/4). *Total* closure
+  (whole system span masked) drops recall to 0/4. *Graded* closure — hiding a growing suffix
+  of the system prompt — traces the curve in between (4/4 -> 2/4 -> 0/4), and its mean recall
+  is the `survival` axis `compare` uses. Both runs complete with no NaN (the finite-logits
+  guard passed), so the collapse is the manipulation, not a numerical artifact.
 - **Residual probe.** The planted codename is undecodable at layer 2 (AUC 0.500), then
   becomes almost perfectly decodable by layers 12 and 22 (0.990 / 1.000), while the
   input-embedding baseline stays at chance (0.500) because the final-token input is
@@ -173,7 +192,8 @@ ok  test_gar_per_layer_matches_hand_calc
 ok  test_gar_schedule_caps_by_model_size
 ok  test_gar_tracks_span_mass
 ok  test_log_metric_is_best_effort
+ok  test_partial_ablation_mask_grades_between_baseline_and_total
 ok  test_report_scope_latest_run
 
-10 passed
+11 passed
 ```

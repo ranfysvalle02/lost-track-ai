@@ -63,12 +63,15 @@ python3 demo.py compare   # cross-architecture dissociation across logged models
   (O(heads * L^2)). To stay within memory the sweep length is **capped by model size**
   (sub-1B models get the full sweep; larger ones are shortened), overridable with
   `--max-turns N`.
-- **`ablate`** — greedy-generates twice per question: normally, and with an additive
-  attention mask that closes the channel from every post-system token onto the
-  system-token span. The mask deliberately leaves the system tokens' own causal
-  self-attention intact (masking *all* rows would produce an all-`-inf` row and a softmax
-  NaN), so any recall collapse is attributable to blinding the model to its instructions,
-  not to a numerical artifact. A runtime guard asserts the logits stay finite.
+- **`ablate`** — closes the channel from post-system tokens onto the system-token span in
+  two regimes. **Total closure** masks the whole span (the clean causal collapse: recall
+  4/4 -> 0/4). **Graded closure** then hides a growing *suffix* of the system prompt
+  (keeping the first 75% / 50% / 25% visible) and measures recall at each step — so some
+  fact lines stay attendable while others can only be recovered from the residual stream.
+  The masks leave each row's causal diagonal intact (masking *all* rows would give an
+  all-`-inf` row and a softmax NaN), and a runtime guard asserts the logits stay finite.
+  The graded survival is the axis `compare` uses, because unlike total closure (0 for
+  everyone) it lands between 0 and 1.
 - **`probe`** — trains a logistic-regression probe on hidden states. It varies the planted
   codename across classes (`Halcyon` / `Borealis` / `Zephyr` / `Cinder`) in the *system
   prompt*, while every episode ends with the *same* fixed question. Because the final-token
@@ -91,10 +94,11 @@ python3 demo.py report --run <run_id> # a single run
 
 - **`compare`** — reads the store (no model load) and lines up each logged model's
   *dissociation signature*: residual-probe AUC (is the goal still decodable?) against
-  ablation survival `ablated/normal` and the crossover turn (does behavior survive when the
-  attention channel is force-closed?). Each model is bucketed as `residual-reliant` (decodable
-  and robust), `attention-reliant` (decodable but recall collapses under closure — the paper's
-  dissociation), or `weak-encoding` (not decodable). Honors `--all-runs` / `--run`.
+  **graded-closure survival** (mean recall as more of the system prompt is hidden — does
+  behavior survive when attention to the goal is progressively closed?). Each model is
+  bucketed as `residual-reliant` (decodable and survives closure), `attention-reliant`
+  (decodable but recall collapses under closure — the paper's dissociation), or
+  `weak-encoding` (not decodable). Honors `--all-runs` / `--run`.
 
 Logging is **best-effort**: if the metrics store can't be opened or a write fails, the
 science modes (`gar`/`ablate`/`probe`) still run and print their results — they just warn
@@ -113,12 +117,16 @@ python3 demo.py compare
 ```
 
 These three ungated small models all expose `eager` attentions and support a system role
-(the demo skips a model whose chat template rejects a system message). In practice, at this
-scale all three land in the **same `attention-reliant` bucket** — the goal is decodable from
-the residual stream (AUC ~0.99–1.0) yet recall collapses when attention to it is closed. So
-the harness reproduces the *method and the per-model signature*, but **not** the architectural
-*divergence* itself: that needs larger, deliberately contrasting families and statistical
-treatment. This is reported honestly rather than dressed up as a contrast.
+(the demo skips a model whose chat template rejects a system message). The graded-closure
+survival is a *real, differentiated* axis — e.g. SmolLM2-360M `0.08`, Qwen2.5-0.5B and
+TinyLlama-1.1B `0.17` — but at this scale all three still sit below the survival threshold
+and land in the **same `attention-reliant` bucket**: the goal is decodable from the residual
+stream (AUC ~0.99–1.0) yet recall falls away as attention to it is closed. So the harness
+reproduces the *method and the per-model signature* (and the survival axis now genuinely
+discriminates, rather than being pinned at 0 by total ablation), but **not** the architectural
+*divergence* itself: flipping a model into `residual-reliant` would need larger, deliberately
+contrasting families and statistical treatment. This is reported honestly rather than dressed
+up as a contrast.
 
 See [SAMPLE_OUTPUT.md](SAMPLE_OUTPUT.md) for a captured run, including the `report` and
 `compare` output.
@@ -266,9 +274,10 @@ the added complexity and risk on a laptop-scale, single-small-model setup.
   two small models invites cherry-picking.
 - **Parametric crossover-turn / failure-timing prediction.** Fitting *when* a model fails is
   fragile on a single 0.5B model and would mostly capture noise.
-- **True sliding-window ablation + persona-violation metrics.** The whole-span mask already
-  proves the causal point, and grading persona drift on a small model is subjective; both add
-  code surface for little incremental evidence unless the project pivots toward a benchmark.
+- **True sliding-window ablation + persona-violation metrics.** The whole-span and graded
+  suffix masks already prove the causal point and give a survival axis that discriminates, and
+  grading persona drift on a small model is subjective; both add code surface for little
+  incremental evidence unless the project pivots toward a benchmark.
 
 ---
 
