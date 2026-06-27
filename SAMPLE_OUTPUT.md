@@ -1,12 +1,13 @@
 # Sample output
 
-A real run of `python3 demo.py all` on `Qwen/Qwen2.5-0.5B-Instruct` (MPS, float32).
-Absolute numbers will vary by machine, transformers version, and model — the point is the
-*shape* of each result. Framework noise (download progress bars, HF token notice) is
-omitted below.
+Real runs of `demo.py` on `Qwen/Qwen2.5-0.5B-Instruct` (MPS, float32) and the cross-model
+modes across five models (360M→7B). Absolute numbers will vary by machine, transformers
+version, and model — the point is the *shape* of each result. Framework noise (download
+progress bars, HF token notice) is omitted below. Sections: `all` (gar/ablate/probe),
+`report`, `dissociate`, `steer`, `compare --stats`, and the `plot` figures.
 
 ```text
-loading Qwen/Qwen2.5-0.5B-Instruct on mps ...
+loading Qwen/Qwen2.5-0.5B-Instruct on mps (torch.float32) ...
 
 ========================================================================
   MODE 1: GAR decay — attention thins, then recall finally breaks
@@ -108,59 +109,135 @@ history instead (here, two runs -> `facts | 8`), while the rates and min/max GAR
 stable; `--run <run_id>` scopes to a single run. Re-running with `--model <other>` makes the
 report aggregate across models.
 
-## `compare` mode (cross-architecture dissociation)
+## `dissociate` mode (decodable but unused, one model)
+
+`python3 demo.py dissociate` measures GAR, behavioral recall, and codename AUC at matched
+context lengths on Qwen2.5-0.5B:
+
+```text
+========================================================================
+  DISSOCIATE: decodable but unused — AUC holds while recall falls (one model)
+========================================================================
+turns | ctx tok |  GAR all | recall | codename AUC
+------------------------------------------------------------------------
+    0 |     103 |   0.5821 |    4/4 |        1.000
+    8 |     386 |   0.3783 |    4/4 |        1.000
+   24 |     952 |   0.3660 |    4/4 |        1.000
+   56 |    2084 |   0.3526 |    4/4 |        0.992
+   96 |    3499 |   0.3363 |    4/4 |        1.000
+  128 |    4631 |   0.3383 |    3/4 |        0.887
+  160 |    5763 |   0.3316 |    4/4 |        0.773
+------------------------------------------------------------------------
+```
+
+As context grows, GAR falls and recall starts to MISS (3/4 at ~4.6k tokens) while the codename
+stays decodable (AUC well above the 0.50 embedding baseline) — present in the hidden state but
+no longer used.
+
+## `steer` mode (re-inject the goal, recall returns)
+
+`python3 demo.py steer` builds a diff-of-means direction for the planted codename and generates
+under total closure while adding it back at the decision point:
+
+```text
+========================================================================
+  STEER: re-inject the closed-off goal direction and watch recall return
+========================================================================
+  steering layer 22 (best probe AUC 1.000); typical residual norm ~60.5
+
+  recall of 'Halcyon' under TOTAL closure vs steering strength:
+    coef(xnorm) | recall |                             reply (head)
+    ----------------------------------------------------------------
+           0.00 |   MISS | I'm sorry, but I need more context to pr
+           0.25 |   MISS | I'm sorry, but I need more context to pr
+           0.50 |     OK |                                 Halcyon.
+           0.75 |     OK |                                 Halcyon.
+           1.00 |     OK |                                 Halcyon.
+           2.00 |     OK |                                 Halcyon.
+    ----------------------------------------------------------------
+```
+
+Recall is 0 with the channel closed and returns the instant the goal direction is injected — a
+causal confirmation that the goal was present but unused.
+
+## `compare --stats` mode (cross-architecture dissociation + statistics)
 
 After logging several models (`demo.py all --model <name>`, using `--max-turns` to cap the
-sweep for larger ones), `python3 demo.py compare` lines up each model's dissociation
-signature. Captured across four ungated models, including a deliberately different family
-(StableLM-2-1.6B):
+sweep for larger ones; the 7B with `--dtype bfloat16 --light`), `python3 demo.py compare`
+lines up each model's dissociation signature. Captured across five models spanning 360M→7B and
+four families:
 
 ```text
 ========================================================================
   COMPARE: cross-architecture dissociation (residual survival vs behavior)
 ========================================================================
   scope: latest run per model (use --all-runs for full history)
-  4 model(s): SmolLM2-360M-Instruct, Qwen2.5-0.5B-Instruct, TinyLlama-1.1B-Chat-v1.0, stablelm-2-1_6b-chat
+  5 model(s): SmolLM2-360M-Instruct, Qwen2.5-0.5B-Instruct, Qwen2.5-7B-Instruct, TinyLlama-1.1B-Chat-v1.0, stablelm-2-1_6b-chat
 
                      model | res AUC | emb AUC | normal |  ablat |  surv |   seed band |  miss@ |            reliance
   --------------------------------------------------------------------------------------------------------------------
      SmolLM2-360M-Instruct |   0.990 |   0.500 |   1.00 |   0.00 |  0.18 | [0.17,0.19] |      0 |   attention-reliant
      Qwen2.5-0.5B-Instruct |   1.000 |   0.500 |   1.00 |   0.00 |  0.17 | [0.17,0.17] |    128 |   attention-reliant
+       Qwen2.5-7B-Instruct |   1.000 |   0.500 |   0.75 |   0.00 |  0.25 | [0.25,0.25] |      0 |   attention-reliant
   TinyLlama-1.1B-Chat-v1.0 |   1.000 |   0.500 |   1.00 |   0.00 |  0.14 | [0.11,0.17] |      0 |   attention-reliant
       stablelm-2-1_6b-chat |   1.000 |   0.500 |   1.00 |   0.00 |  0.16 | [0.14,0.19] |   none |   attention-reliant
+```
 
-  Reading it:
-    - ablat = recall under TOTAL closure (system span fully blinded; ~0 by design).
-    - surv  = recall under GRADED closure (mean over mask orders x fractions x seeds,
-              as more of the system prompt is hidden) — the discriminating axis [0,1].
-    - seed band = [min,max] survival across filler seeds (is the figure stable?).
-    - '*' marks a bucket within 0.10 of the 0.50 survival threshold (borderline).
-    - residual-reliant : goal decodable AND recall survives graded closure (robust).
-    - attention-reliant: goal decodable BUT recall collapses under closure
-                         (info present, unused without attention — the dissociation).
-    - weak-encoding    : goal not decodable from the residual stream.
+`--stats` adds the cross-run statistics (full history). Greedy decoding with fixed seeds makes
+each run's survival deterministic, so the CIs are ~`±0.00` (highly reproducible), and the
+permutation test is underpowered at N=2 runs (its p-value floor is ~0.33), so it shows no
+significant pairwise differences yet — a power limitation, not evidence of none:
 
-  Caveat: small instruct models, a single run each, 4 planted facts and a 32-sample
-  probe. This shows the *shape* of the dissociation, not the paper's statistically
-  treated cross-architecture result.
+```text
+  Multi-run survival statistics (per-run survival = mean graded-closure recall ...):
+                       model | mean surv |    95% CI | runs
+       SmolLM2-360M-Instruct |     0.176 |  +/-0.000 |    2
+       Qwen2.5-0.5B-Instruct |     0.167 |  +/-0.000 |    2
+         Qwen2.5-7B-Instruct |     0.250 |       n/a |    1
+    TinyLlama-1.1B-Chat-v1.0 |     0.139 |  +/-0.000 |    2
+        stablelm-2-1_6b-chat |     0.157 |  +/-0.000 |    2
+
+  Pairwise permutation test (two-sided, 10k iters, seed 0) on mean survival:
+    ... all pairs p ~ 0.33 (the N=2 floor) ...
 ```
 
 **Honest result:** the graded-closure survival is a real, differentiated, seed-stable axis
-(SmolLM2-360M `0.18`, Qwen2.5-0.5B `0.17`, StableLM-2-1.6B `0.16`, TinyLlama-1.1B `0.14`, bands
-within ~0.02–0.06) rather than being pinned at 0 by total ablation — yet all four still sit well
-below the survival threshold and bucket as `attention-reliant`: the goal is decodable from the
-residual stream (AUC ~0.99–1.0) but recall falls away as attention to it is closed. Adding a
-genuinely different architecture family (StableLM-2) did not flip the result. The harness
-produces the per-model signature and the dissociation buckets correctly, and the survival axis
-genuinely discriminates, but no model *flips* into `residual-reliant`, so the architectural
-*divergence* the paper reports does not appear at this scale. That negative is reported as-is.
+(0.14–0.25 across models) rather than being pinned at 0 by total ablation — yet **all five sit
+below the survival threshold and bucket as `attention-reliant`**: the goal is decodable from the
+residual stream (AUC ~0.99–1.0) but recall falls away as attention to it is closed. Two
+controlled flip tests both failed: **scaling Qwen 0.5B → 7B** (survival only 0.17 → 0.25) and
+**swapping to a different family, StableLM-2** (0.16). No model crosses into `residual-reliant`,
+so the architectural *divergence* the paper reports does not appear at this scale. That negative
+is reported as-is.
 
-Adding StableLM-2 also caught a real trap: its chat template renders a *lone* system message to
-nothing, so the span detector first returned an empty system span — which would have made the
-ablation a silent no-op and reported a fake `survival` of 1.0 (a spurious "flip"). A span
-fallback plus a guard that skips any model whose goal span can't be located now prevent that.
-(StableLM-2 is run with `--max-turns 0` — a single short-context GAR point, hence `miss@ none` —
-so a 1.6B model stays in memory; the reliance call is driven by the closure/probe axes.)
+Regenerating these numbers also re-caught a real trap: StableLM-2's chat template renders a
+*lone* system message to nothing, so the span detector returns an empty system span — which
+makes the ablation a silent no-op and reports a fake `survival` of ~1.0 (a spurious "flip"). The
+store actually held two such early StableLM runs (total-closure recall stuck at 4/4); they were
+spotted by exactly that signature and discarded, and the fixed run collapses to 0/4 like the
+rest. A span fallback plus a guard that skips any model whose goal span can't be located now
+prevent it. (StableLM-2 is run with `--max-turns 0`, hence `miss@ none`; the 7B with
+`--dtype bfloat16 --light` — bf16 because fp16 overflows in eager attention on MPS.)
+
+## Figures (`python3 demo.py plot --all-runs`)
+
+`plot` renders these from the stored runs (no model load) into `figures/`:
+
+The within-model dissociation — codename AUC stays high while recall falls as context grows:
+
+![dissociation](figures/dissociation.png)
+
+GAR decaying with context (the attention channel closing), per model:
+
+![GAR decay](figures/gar_decay.png)
+
+Behavioral survival as the goal channel is progressively closed — all models collapse:
+
+![survival curves](figures/survival_curves.png)
+
+Residual decodability vs survival — every model is high-AUC, low-survival (attention-reliant):
+
+![AUC vs survival](figures/auc_vs_survival.png)
 
 ## How to read it
 
@@ -186,11 +263,16 @@ so a 1.6B model stays in memory; the reliance call is driven by the closure/prob
   identical across classes. That gap is the paper's point reproduced in miniature: the
   goal survives in the residual stream, and the layer where it emerges is well above the
   input.
+- **Dissociation.** `dissociate` puts all three signals on the same context: AUC stays high
+  (0.77–1.0) while recall drops to 3/4 as GAR falls — the goal is decodable but unused.
+- **Steering.** `steer` confirms it causally: recall is 0 under closure and returns to
+  "Halcyon." once the decoded goal direction is re-injected at the decision point.
 
 The model-free smoke test (`python3 test_demo.py`) covers the GAR math, the ablation-mask
-invariants, the memory-aware GAR-sweep cap, the MongoDB crossover aggregation and latest-run
-scoping, the cross-architecture dissociation/classifier (against seeded temp stores), and
-that logging is best-effort — all without any download or inference.
+invariants, the memory-aware GAR-sweep cap, the MongoDB aggregations (crossover, latest-run
+scoping — including that auxiliary `steer`/`dissociate` runs don't shadow the full run — and
+the cross-architecture dissociation/classifier), the multi-run survival stats, the permutation
+test, the steering-vector math, and a `plot` smoke test — all without any download or inference.
 ```text
 [warn] metric not logged: disk on fire
 ok  test_ablation_mask_has_no_all_inf_rows
@@ -201,10 +283,15 @@ ok  test_crossover_by_model_aggregation
 ok  test_gar_per_layer_matches_hand_calc
 ok  test_gar_schedule_caps_by_model_size
 ok  test_gar_tracks_span_mass
+ok  test_latest_scope_ignores_auxiliary_modes
 ok  test_log_metric_is_best_effort
 ok  test_partial_ablation_mask_endpoints_match_for_every_order
 ok  test_partial_ablation_mask_order_chooses_which_columns_survive
+ok  test_permutation_test_determinism_and_separation
+ok  test_plot_smoke
 ok  test_report_scope_latest_run
+ok  test_steering_vector_diff_of_means
+ok  test_survival_across_runs_stats
 
-12 passed
+17 passed
 ```

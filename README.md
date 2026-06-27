@@ -45,12 +45,16 @@ MongoDB store (smongo) so results accumulate into a queryable experiment log (se
 [Why MongoDB, via smongo](#why-mongodb-via-smongo)).
 
 ```bash
-python3 demo.py gar       # GAR decay: attention to the system prompt thins as turns grow
-python3 demo.py ablate    # force-close the channel to system tokens -> recall collapses
-python3 demo.py probe     # the planted value survives in the residual stream (high AUC)
-python3 demo.py all       # run all three (and log every measurement)
-python3 demo.py report    # aggregate stored runs via MongoDB pipelines (no model load)
-python3 demo.py compare   # cross-architecture dissociation across logged models (no model load)
+python3 demo.py gar        # GAR decay: attention to the system prompt thins as turns grow
+python3 demo.py ablate     # force-close the channel to system tokens -> recall collapses
+python3 demo.py probe      # the planted value survives in the residual stream (high AUC)
+python3 demo.py dissociate # one model: AUC stays high while recall falls (decodable but unused)
+python3 demo.py steer      # re-inject the closed-off goal direction and watch recall return
+python3 demo.py all        # run gar + ablate + probe (and log every measurement)
+python3 demo.py report     # aggregate stored runs via MongoDB pipelines (no model load)
+python3 demo.py compare    # cross-architecture dissociation across logged models (no model load)
+python3 demo.py compare --stats  # + multi-run CIs and a pairwise permutation test
+python3 demo.py plot --all-runs  # render the figures below from the stored runs (no model load)
 ```
 
 - **`gar`** — appends a fact question at growing context lengths and reports GAR (attention
@@ -80,6 +84,24 @@ python3 demo.py compare   # cross-architecture dissociation across logged models
   input is identical across classes, the input-embedding probe is a genuine chance
   baseline; a high residual-stream AUC therefore means the model propagated the planted
   value forward into its hidden state even after the attention channel thinned.
+- **`dissociate`** — the paper's headline shown *within a single model*, on the faithful
+  axis. At each context length it measures all three signals on the same prompt: GAR,
+  behavioral recall of the four facts, and codename decodability (CV probe AUC). As context
+  grows, GAR falls and recall starts to MISS while the **AUC stays high** — the goal is
+  still *present* in the hidden state, just no longer *used*. Decodability is measured under
+  natural attention decay (more filler), **not** the ablation mask: a hard column mask severs
+  the path to the goal so AUC would collapse with recall, leaving nothing to dissociate.
+- **`steer`** — diagnosis → intervention. It builds a steering vector for the planted
+  codename as a **diff-of-means** in the residual stream (mean of the planted-codename
+  samples minus the others, at the best probe layer), then generates **under total closure**
+  while adding that direction back at the decision point, sweeping its strength. Recall climbs
+  from 0 (closed off) to restored — a causal confirmation that the goal was *present but
+  unused*, not absent. (A cruder all-position steer makes a 0.5B fixate on the first
+  sub-token; reported as measured.)
+- **`plot`** — reads the store (no model load) and renders the four figures below to
+  committed PNGs in `figures/`. Use `--all-runs` so the `dissociate`/`steer` runs (which log
+  their own run_ids) are in scope; the default latest-per-model scope covers only the
+  `all`-pipeline figures.
 - **`report`** — reads the embedded MongoDB store (no model load) and runs aggregation
   pipelines: GAR decay range, the first recall MISS (crossover turn) per model, ablation
   recall (shown as a per-fact rate, `ok/facts`, so it stays meaningful no matter how many
@@ -101,16 +123,57 @@ python3 demo.py report --run <run_id> # a single run
   progressively closed?). Each model is bucketed as `residual-reliant` (decodable and
   survives closure), `attention-reliant` (decodable but recall collapses under closure — the
   paper's dissociation), or `weak-encoding` (not decodable); a `*` marks buckets within
-  `0.10` of the `0.50` survival threshold (borderline). Honors `--all-runs` / `--run`.
+  `0.10` of the `0.50` survival threshold (borderline). Honors `--all-runs` / `--run`. Add
+  **`--stats`** (uses the full history) to treat survival across *runs*: it prints each
+  model's mean ± 95% CI (n runs) and a pairwise **permutation test** p-value on the
+  difference in mean survival. Re-run `all` several times per model first so N > 1.
 
 Logging is **best-effort**: if the metrics store can't be opened or a write fails, the
 science modes (`gar`/`ablate`/`probe`) still run and print their results — they just warn
 that the measurement wasn't logged. `report` and `compare` are the only modes that need the store.
 
-### Cross-architecture comparison (descriptive)
+### The headline, in one model: decodable but unused (`dissociate`)
 
-The paper's headline is a *cross-architecture dissociation* — "what survives reveals
-architecture." You can push toward it by logging several models and comparing:
+The paper's central claim is that the goal can be *present yet unused*: still recoverable
+from the hidden state after the attention channel has thinned, but no longer driving
+behavior. `dissociate` shows exactly that within Qwen2.5-0.5B, on the faithful axis (context
+length, i.e. natural attention decay — not a hard mask):
+
+![codename AUC stays high while recall falls as context grows](figures/dissociation.png)
+
+As context grows from ~100 to ~5.8k tokens, GAR falls from `0.58` to `0.33` and behavioral
+recall drops a fact (4/4 → 3/4 around 4.6k tokens), yet the codename stays decodable from the
+residual stream the whole way (AUC `0.77`–`1.0`, far above the `0.50` embedding baseline). The
+gap between the blue (decodability) and red (behavior) curves *is* the dissociation. On a 0.5B
+model it is noisy (recall can recover at still-longer context), but the shape is the paper's.
+
+GAR itself decays monotonically as the conversation grows — the attention channel closing:
+
+![GAR vs context length, per model](figures/gar_decay.png)
+
+### Steering: surface the goal and recall returns (`steer`)
+
+If the goal is merely *unused* under closure, re-surfacing it should restore behavior — and it
+does. `steer` builds a diff-of-means direction for the planted codename in the residual
+stream, then generates **under total closure** while adding it back at the decision point:
+
+```text
+    coef(xnorm) | recall |                             reply (head)
+           0.00 |   MISS | I'm sorry, but I need more context to pr
+           0.25 |   MISS | I'm sorry, but I need more context to pr
+           0.50 |     OK |                                 Halcyon.
+           1.00 |     OK |                                 Halcyon.
+```
+
+Recall is 0 with the channel closed and returns the moment the goal direction is injected — a
+causal confirmation that the information was present but unused, not absent. (A cruder
+all-position steer instead makes a 0.5B fixate on the first sub-token, `Hal Hal Hal…`;
+reported as measured.)
+
+### Cross-architecture comparison + statistics (`compare`)
+
+The paper's *cross-architecture* headline is that what survives the channel closing "reveals
+architecture." Log several models and compare their dissociation signatures:
 
 ```bash
 python3 demo.py all --model Qwen/Qwen2.5-0.5B-Instruct
@@ -120,28 +183,72 @@ python3 demo.py all --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --max-turns 24
 # short-context point so a 1.6B model stays in memory while ablate/probe (which drive the
 # reliance call) run normally. trust_remote_code is enabled in the loader for such repos.
 python3 demo.py all --model stabilityai/stablelm-2-1_6b-chat --max-turns 0
-python3 demo.py compare
+python3 demo.py compare --stats   # run `all` a few times per model first so N > 1
 ```
 
-All four ungated models expose `eager` attentions and support a system role. The demo will
-**skip** a model whose chat template rejects a system message, *and* one whose system-prompt
-token span can't be located (an empty span would silently turn the ablation into a no-op and
-report fake "survival" — StableLM-2 actually tripped this, since its template renders a lone
-system message to nothing; the span detector now has a fallback and the run is guarded).
+These models expose `eager` attentions and support a system role. The demo will **skip** a
+model whose chat template rejects a system message, *and* one whose system-prompt token span
+can't be located — an empty span would silently turn the ablation into a no-op and report
+fake "survival." StableLM-2 actually tripped this (its template renders a lone system message
+to nothing), so the span detector now has a fallback and the run is guarded; the guard caught
+two early StableLM runs whose total closure left recall at 4/4 (the no-op), and once fixed the
+model collapses to 0/4 like the rest.
 
-The graded-closure survival is a *real, differentiated* axis with tight seed bands —
-SmolLM2-360M `0.18`, Qwen2.5-0.5B `0.17`, StableLM-2-1.6B `0.16`, TinyLlama-1.1B `0.14` — but
-at this scale all four still sit well below the survival threshold and land in the **same
-`attention-reliant` bucket**: the goal is decodable from the residual stream (AUC ~0.99–1.0)
-yet recall falls away as attention to it is closed. Adding a genuinely different architecture
-family (StableLM-2) did **not** flip the result. So the harness reproduces the *method and the
-per-model signature* (de-confounded across mask orderings and seeds, no longer pinned at 0 by
-total ablation), but **not** the architectural *divergence* itself: flipping a model into
-`residual-reliant` would need larger, deliberately contrasting families and statistical
-treatment. This is reported honestly rather than dressed up as a contrast.
+![residual decodability vs survival; all models cluster at high AUC, low survival](figures/auc_vs_survival.png)
 
-See [SAMPLE_OUTPUT.md](SAMPLE_OUTPUT.md) for a captured run, including the `report` and
-`compare` output.
+The graded-closure survival is a *real, differentiated* axis with tight seed bands, but every
+model — across 360M→7B and four families — lands in the **same `attention-reliant` bucket**:
+the goal is decodable from the residual stream (AUC ~`0.99`–`1.0`) yet recall collapses as
+attention to it is closed.
+
+| model | residual AUC | survival | reliance |
+|---|---|---|---|
+| Qwen2.5-7B-Instruct | 1.00 | 0.25 | attention-reliant |
+| SmolLM2-360M-Instruct | 0.99 | 0.18 | attention-reliant |
+| Qwen2.5-0.5B-Instruct | 1.00 | 0.17 | attention-reliant |
+| stablelm-2-1.6b-chat | 1.00 | 0.16 | attention-reliant |
+| TinyLlama-1.1B-Chat-v1.0 | 1.00 | 0.14 | attention-reliant |
+
+All five collapse as the channel closes (the dissociation is the gap between AUC and the
+curves below):
+
+![recall vs visible fraction of the system span, per model](figures/survival_curves.png)
+
+So the harness reproduces the *method and the per-model signature* — de-confounded across mask
+orderings and filler seeds, no longer pinned at 0 by total ablation — but **not** the
+architectural *divergence* itself. Crucially, **neither scaling within a family (Qwen 0.5B →
+7B, still `0.25`) nor swapping to a different family (StableLM-2) flipped a model into
+`residual-reliant`.** That is reported honestly rather than dressed up as a contrast: getting
+an actual flip would need larger, deliberately contrasting families.
+
+`compare --stats` treats survival across runs. Because greedy decoding with fixed filler seeds
+makes each run's survival essentially deterministic, the per-model 95% CIs are ~`±0.00` (the
+measurement is highly reproducible). The pairwise permutation test is included for
+completeness but is **underpowered at N = 2** runs per model — its smallest achievable p-value
+is ~`0.33` regardless of separation — so it reports no significant pairwise differences yet;
+that is a power limitation, not evidence of no difference. Re-run `all` many times per model to
+give it teeth.
+
+### Run it bigger (GPU / cloud)
+
+A true 7B+ flip test wants more memory than a laptop. The same commands run unchanged on a GPU
+box; pick a dtype that fits and drop `--light` for the full sweep:
+
+```bash
+# On a CUDA box (auto picks bfloat16 for large models on gpu):
+python3 demo.py all --model Qwen/Qwen2.5-7B-Instruct --dtype auto
+python3 demo.py all --model Qwen/Qwen2.5-14B-Instruct --dtype bfloat16 --max-turns 24
+python3 demo.py compare --stats
+```
+
+Locally, a 7B fits in ~15 GB with `--dtype bfloat16 --light` (1 seed, 1 mask order, short
+generations, GAR pinned to 0 turns). Use **bfloat16, not float16**: fp16's narrow range
+overflows in this model's eager attention on MPS, yielding NaN GAR and non-finite logits under
+the ablation mask. `--dtype auto` keeps small models in float32 and drops >2B-param models to
+bfloat16 on mps/cuda.
+
+See [SAMPLE_OUTPUT.md](SAMPLE_OUTPUT.md) for captured runs, including `report`,
+`compare --stats`, `dissociate`, and `steer`.
 
 ---
 
@@ -156,12 +263,18 @@ See [SAMPLE_OUTPUT.md](SAMPLE_OUTPUT.md) for a captured run, including the `repo
   unmodified model on the same prompts (the clean, total collapse).
 - The planted value is decodable from the residual stream well above the input-embedding
   baseline — i.e. the information survives the channel thinning.
+- **The dissociation within one model** (`dissociate`): as context grows, decodability
+  (probe AUC) stays high while behavioral recall starts to miss — present but unused.
+- **A causal handle on it** (`steer`): re-injecting the decoded goal direction under closure
+  restores recall, confirming the goal was usable, just not used.
+- The whole picture is **stable and reproducible** across repeated runs, and consistent across
+  five models spanning 360M→7B and four architecture families (all `attention-reliant`).
 
 **It does not claim:**
 
-- To reproduce the paper's absolute numbers. This is a single 0.5B model with home-grown
-  prompts and a tiny probe set; the paper uses multiple architectures, larger fact sets,
-  and proper statistical treatment.
+- To reproduce the paper's absolute numbers. These are small models (360M–7B) with
+  home-grown prompts and a tiny probe set; `compare --stats` adds CIs and a permutation test,
+  but the paper uses larger architectures, bigger fact sets, and far more statistical power.
 - That the ablation is the paper's exact sliding-window procedure. It is a simpler
   whole-span column mask that captures the same idea (generated tokens can no longer see
   goal tokens).
@@ -227,8 +340,11 @@ The metrics store defaults to `local://lost_track_db` (git-ignored); override wi
 
 `test_demo.py` is a fast, model-free smoke test (no model download, no inference) covering the
 GAR helper on synthetic attention tensors, the ablation-mask invariants (no all-`-inf` rows,
-finite softmax, correct columns masked), and the MongoDB crossover aggregation against a
-seeded temporary store:
+finite softmax, correct columns masked), the MongoDB aggregations (crossover, latest-run
+scoping, the dissociation `compare` signature) against seeded temporary stores, plus the new
+**multi-run survival stats** (mean/CI/n), the **permutation test** (determinism + clear
+separation), the **steering-vector diff-of-means** math, and a **`plot` smoke test** that
+renders all four figures to a temp dir:
 
 ```bash
 python3 test_demo.py          # or: pytest test_demo.py
@@ -268,12 +384,18 @@ the added complexity and risk on a laptop-scale, single-small-model setup.
 
 ### Worth doing carefully (frame honestly)
 
-- **Cross-model comparison (now implemented, descriptively).** `demo.py compare` lines up each
-  logged model's dissociation signature (residual AUC vs ablation survival vs crossover) and
-  buckets it as residual-/attention-reliant or weak-encoding. As shipped, the three sampled
-  small models all came out `attention-reliant` — so this is a working harness and an honest
-  per-model signature, not the *contrasting* failure mode. Getting an actual divergence would
-  need larger, deliberately chosen families (see below).
+- **Cross-model comparison (implemented, descriptively + with stats).** `demo.py compare`
+  lines up each logged model's dissociation signature, and `--stats` adds cross-run CIs and a
+  pairwise permutation test. As shipped, five models spanning 360M→7B and four families all
+  came out `attention-reliant` — scaling Qwen 0.5B→7B and swapping to StableLM-2 both failed to
+  flip the bucket — so this is a working harness and an honest per-model signature, not the
+  *contrasting* failure mode. Getting an actual divergence would need larger, deliberately
+  chosen families (see below), and a permutation test with real power needs many runs per model
+  (at N=2 its p-value floor is ~0.33).
+- **Within-model dissociation + steering (implemented).** `demo.py dissociate` shows
+  decodability holding while recall falls inside one model, and `demo.py steer` restores recall
+  under closure by re-injecting the decoded goal direction — the paper's claim made causal,
+  beyond the descriptive probe.
 - **Longer / cleaner behavioral failure curve.** MODE 1 currently shows a single, noisy
   natural MISS at ~4.6k tokens. Averaging over several filler orderings per length (and
   reporting a recall rate, not a single 0/1 outcome) would smooth the curve and make the

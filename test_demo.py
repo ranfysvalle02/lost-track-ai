@@ -38,6 +38,11 @@ from demo import (
     latest_run_ids,
     log_metric,
     open_metrics,
+    permutation_test_survival,
+    resolve_scope,
+    run_plot,
+    steering_vector,
+    survival_across_runs_by_model,
 )
 
 
@@ -285,6 +290,151 @@ def test_compare_dissociation() -> None:
         assert rows["F"]["reliance"] == "attention-reliant", rows["F"]
         # V sits exactly on the threshold -> residual-reliant (>=) and borderline.
         assert rows["V"]["reliance"] == "residual-reliant", rows["V"]
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_latest_scope_ignores_auxiliary_modes() -> None:
+    # A later `steer`/`dissociate`-only run must not shadow the full `all` run in the
+    # latest-per-model scope (those modes log their own run_ids with no closure/probe docs).
+    tmp = tempfile.mkdtemp()
+    try:
+        coll = open_metrics("local://" + os.path.join(tmp, "db"))
+        old = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        new = old + timedelta(hours=1)
+        coll.insert_many([
+            # The real `all` run (older): has the comparable closure/probe docs.
+            {"model": "A", "run_id": "full", "ts": old, "mode": "closure", "fact": "a",
+             "frac": 0.5, "order": "strided", "seed": 0, "recall_ok": 1},
+            {"model": "A", "run_id": "full", "ts": old, "mode": "probe", "repr": "residual",
+             "auc": 0.99},
+            # A newer steer-only run for the same model (must not become "the latest run").
+            {"model": "A", "run_id": "steer1", "ts": new, "mode": "steer", "layer": 5,
+             "alpha": 1.0, "recall_ok": 1},
+        ])
+        match, _ = resolve_scope(coll, "latest")
+        assert match == {"run_id": {"$in": ["full"]}}, match
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_survival_across_runs_stats() -> None:
+    # Per-run survival = mean recall_ok over partial-closure docs (frac < 1.0). Model A has two
+    # runs (survival 0.5 and 1.0 -> mean 0.75 with a real CI); model B has one (CI undefined).
+    tmp = tempfile.mkdtemp()
+    try:
+        coll = open_metrics("local://" + os.path.join(tmp, "db"))
+
+        def run_docs(model, run_id, oks):
+            out = [{"model": model, "run_id": run_id, "mode": "closure", "fact": "a",
+                    "frac": 0.5, "order": "strided", "seed": 0, "recall_ok": ok} for ok in oks]
+            # A frac == 1.0 baseline doc that must be excluded from the survival average.
+            out.append({"model": model, "run_id": run_id, "mode": "closure", "fact": "a",
+                        "frac": 1.0, "order": "baseline", "seed": 0, "recall_ok": 1})
+            return out
+
+        docs = []
+        docs += run_docs("A", "a1", [1, 0])  # per-run survival 0.5
+        docs += run_docs("A", "a2", [1, 1])  # per-run survival 1.0
+        docs += run_docs("B", "b1", [1, 1])  # per-run survival 1.0, single run
+        coll.insert_many(docs)
+
+        rows = {r["model"]: r for r in survival_across_runs_by_model(coll)}
+        assert set(rows) == {"A", "B"}, rows
+        assert rows["A"]["n_runs"] == 2 and abs(rows["A"]["mean"] - 0.75) < 1e-9, rows["A"]
+        # sample std of [0.5, 1.0] = 0.35355..., CI half-width = 1.96 * std / sqrt(2).
+        assert abs(rows["A"]["std"] - 0.3535533906) < 1e-6, rows["A"]
+        assert abs(rows["A"]["ci95"] - 1.96 * 0.3535533906 / (2 ** 0.5)) < 1e-6, rows["A"]
+        # A single run has no sample std -> CI undefined.
+        assert rows["B"]["n_runs"] == 1 and rows["B"]["std"] is None, rows["B"]
+        assert rows["B"]["ci95"] is None, rows["B"]
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_permutation_test_determinism_and_separation() -> None:
+    # Cleanly separated models (HI survives every run, LO never does) -> the observed mean-diff
+    # is extreme under the permutation null, so p is small; and a fixed seed is deterministic.
+    tmp = tempfile.mkdtemp()
+    try:
+        coll = open_metrics("local://" + os.path.join(tmp, "db"))
+        docs = []
+        for i in range(5):
+            docs.append({"model": "HI", "run_id": f"hi{i}", "mode": "closure", "fact": "a",
+                         "frac": 0.5, "order": "strided", "seed": 0, "recall_ok": 1})
+            docs.append({"model": "LO", "run_id": f"lo{i}", "mode": "closure", "fact": "a",
+                         "frac": 0.5, "order": "strided", "seed": 0, "recall_ok": 0})
+        coll.insert_many(docs)
+
+        a = permutation_test_survival(coll, "HI", "LO", iters=2000, seed=0)
+        b = permutation_test_survival(coll, "HI", "LO", iters=2000, seed=0)
+        assert a["p_value"] == b["p_value"], (a, b)         # deterministic given seed
+        assert abs(a["diff"] - 1.0) < 1e-9, a               # HI survival 1.0 - LO 0.0
+        assert a["n_a"] == 5 and a["n_b"] == 5, a
+        assert a["p_value"] < 0.05, a                       # clear separation -> small p
+        # A different seed should still land in the same (tiny) ballpark, not wildly off.
+        c = permutation_test_survival(coll, "HI", "LO", iters=2000, seed=1)
+        assert c["p_value"] < 0.05, c
+        # Missing model -> graceful None, no crash.
+        none = permutation_test_survival(coll, "HI", "NOPE")
+        assert none["p_value"] is None and none["n_b"] == 0, none
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_steering_vector_diff_of_means() -> None:
+    # Class 0 sits at +x, the other classes at -x; the diff-of-means direction must point along
+    # +x and be unit-norm, regardless of the (irrelevant) noise dimensions.
+    X = [
+        [10.0, 0.0, 0.0],   # label 0
+        [10.0, 0.0, 1.0],   # label 0
+        [-10.0, 5.0, 0.0],  # label 1
+        [-10.0, -5.0, 0.0],  # label 2
+    ]
+    y = [0, 0, 1, 2]
+    v = steering_vector(X, y, target_label=0)
+    assert abs((v ** 2).sum() - 1.0) < 1e-9, v          # unit length
+    assert v[0] > 0.99, v                                # dominated by the +x separation
+    assert abs(v[1]) < 1e-6 and abs(v[2]) < 0.2, v       # other dims near zero
+
+
+def test_plot_smoke() -> None:
+    # run_plot must render its figures from a seeded store and write PNG files. Skipped if
+    # matplotlib isn't installed (it is an explicit dependency but optional for this smoke).
+    try:
+        import matplotlib  # noqa: F401
+    except ImportError:
+        print("skip test_plot_smoke (matplotlib not installed)")
+        return
+    tmp = tempfile.mkdtemp()
+    try:
+        coll = open_metrics("local://" + os.path.join(tmp, "db"))
+        docs = []
+        # GAR + dissociate over two context lengths, closure over two fracs, a probe pair.
+        for turns, ctx, gar, recall, auc in [(0, 100, 0.6, 4, 1.0), (160, 5000, 0.3, 2, 0.98)]:
+            docs.append({"model": "M", "run_id": "r", "mode": "gar", "turns": turns,
+                         "ctx_tokens": ctx, "gar_all": gar, "recall": recall, "recall_miss": recall < 4})
+            docs.append({"model": "M", "run_id": "r", "mode": "dissociate", "turns": turns,
+                         "ctx_tokens": ctx, "gar_all": gar, "recall": recall, "n_facts": 4,
+                         "codename_auc": auc})
+        for frac in (1.0, 0.5):
+            for seed in (0, 1):
+                docs.append({"model": "M", "run_id": "r", "mode": "closure", "fact": "a",
+                             "frac": frac, "order": "strided", "seed": seed,
+                             "recall_ok": 1 if frac == 1.0 else 0})
+        docs.append({"model": "M", "run_id": "r", "mode": "probe", "repr": "residual", "auc": 0.98})
+        docs.append({"model": "M", "run_id": "r", "mode": "probe", "repr": "embedding", "auc": 0.50})
+        docs.append({"model": "M", "run_id": "r", "mode": "ablate", "fact": "a",
+                     "normal_ok": 1, "ablated_ok": 0})
+        coll.insert_many(docs)
+
+        figdir = os.path.join(tmp, "figs")
+        written = run_plot(coll, scope="all", figdir=figdir)
+        names = {os.path.basename(p) for p in written}
+        assert {"gar_decay.png", "survival_curves.png", "auc_vs_survival.png",
+                "dissociation.png"} <= names, names
+        for p in written:
+            assert os.path.exists(p) and os.path.getsize(p) > 0, p
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

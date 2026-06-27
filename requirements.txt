@@ -6,6 +6,7 @@ torch>=2.2
 transformers>=4.44
 scikit-learn>=1.3
 numpy>=1.24
+matplotlib>=3.7
 smongo>=1.2
 pymongo>=4.6
 # Optional: only needed for the contrasting `compare` model stabilityai/stablelm-2-1_6b-chat,

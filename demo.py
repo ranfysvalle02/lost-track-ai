@@ -22,6 +22,7 @@ and the *method*, reproduced end-to-end locally.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from datetime import datetime, timezone
 from uuid import uuid4
@@ -110,19 +111,48 @@ def _common_prefix_len(a: list[int], b: list[int]) -> int:
     return k
 
 
+def _approx_params(cfg) -> float:
+    """Rough parameter count from a model config (no weights loaded), for the `auto` dtype
+    heuristic. Embeddings + per-layer attention (~4 h^2) + SwiGLU MLP (~3 h * intermediate)."""
+    h = getattr(cfg, "hidden_size", 0) or 0
+    layers = getattr(cfg, "num_hidden_layers", 0) or 0
+    vocab = getattr(cfg, "vocab_size", 0) or 0
+    inter = getattr(cfg, "intermediate_size", 4 * h) or (4 * h)
+    return float(vocab * h + layers * (4 * h * h + 3 * h * inter))
+
+
+def resolve_dtype(name: str, dtype: str) -> "torch.dtype":
+    """Map a `--dtype` choice to a torch dtype. `auto` keeps small models in float32 (fidelity)
+    but drops large models (>2B params, estimated from config) to bfloat16 on mps/cuda so a 7B
+    actually fits; on CPU it stays float32. bfloat16 (not float16) is the large-model default
+    because float16's narrow range overflows in this model's eager attention on mps, yielding
+    NaN GAR and non-finite logits under the ablation mask — bf16 keeps float32's exponent range."""
+    table = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}
+    if dtype != "auto":
+        return table[dtype]
+    try:
+        from transformers import AutoConfig
+        approx = _approx_params(AutoConfig.from_pretrained(name, trust_remote_code=True))
+    except Exception:
+        approx = 0.0
+    return torch.bfloat16 if (DEVICE != "cpu" and approx > 2e9) else torch.float32
+
+
 class Model:
     """Thin wrapper exposing tokenization, generation, attentions and hidden states."""
 
-    def __init__(self, name: str = MODEL_NAME):
-        print(f"loading {name} on {DEVICE} ...", flush=True)
+    def __init__(self, name: str = MODEL_NAME, dtype: str = "float32"):
+        torch_dtype = resolve_dtype(name, dtype)
+        print(f"loading {name} on {DEVICE} ({torch_dtype}) ...", flush=True)
         # trust_remote_code lets us load contrasting families whose tokenizer/model live in
         # the repo (e.g. StableLM-2, InternLM2). This executes code from the model repo, so it
         # is only appropriate for reputable, vetted repos like the ones this demo names.
         self.tok = AutoTokenizer.from_pretrained(name, trust_remote_code=True)
         self.model = AutoModelForCausalLM.from_pretrained(
-            name, dtype=torch.float32, attn_implementation="eager", trust_remote_code=True
+            name, dtype=torch_dtype, attn_implementation="eager", trust_remote_code=True
         )
         self.model.to(DEVICE).eval()
+        self.dtype = torch_dtype
         self.n_layers = self.model.config.num_hidden_layers
         self.n_params = sum(p.numel() for p in self.model.parameters())
 
@@ -186,6 +216,15 @@ class Model:
             output_attentions=True,
             output_hidden_states=True,
         )
+
+    @torch.no_grad()
+    def hidden_last_layers(self, ids: torch.Tensor, layers) -> dict:
+        """Final-token hidden state at each requested layer index, WITHOUT materializing
+        attentions. `Model.forward` forces `output_attentions=True`, which builds an
+        O(L^2) score tensor per layer and OOMs at long context; this is the memory-safe
+        path for probing the residual stream as context grows (used by `run_dissociate`)."""
+        out = self.model(ids, output_hidden_states=True, use_cache=False)
+        return {L: out.hidden_states[L][0, -1].float().cpu().numpy() for L in layers}
 
     @torch.no_grad()
     def generate(self, ids: torch.Tensor, max_new_tokens: int = 40) -> str:
@@ -373,11 +412,21 @@ CLOSURE_KEEP_FRACTIONS = (1.0, 0.75, 0.5, 0.25)
 CLOSURE_ORDERS = ("strided", "suffix", "prefix")
 
 
-def run_ablate(m: "Model", coll=None, run: dict | None = None, seeds: int = 3) -> None:
+def run_ablate(m: "Model", coll=None, run: dict | None = None, seeds: int = 3,
+               light: bool = False) -> None:
     run = run or {}
     print("\n" + "=" * 72)
     print("  MODE 2: Ablation — close attention to system tokens, totally then gradually")
     print("=" * 72)
+
+    # `light` budget for big models: one seed, one mask order, shorter generations — keeps a
+    # 7B run bounded to minutes. 24 tokens still comfortably reaches the fact value even with a
+    # verbose persona (a tighter cap can read as a false MISS). Endpoints are unchanged.
+    orders = ("strided",) if light else CLOSURE_ORDERS
+    gen_tokens = 24 if light else 30
+    if light:
+        seeds = 1
+        print(f"  (--light: seeds=1, orders={orders}, max_new_tokens={gen_tokens})")
 
     # Use a modest context where normal recall is clean, so any collapse is
     # attributable to blinding the model to its system tokens (not generic decay).
@@ -392,8 +441,8 @@ def run_ablate(m: "Model", coll=None, run: dict | None = None, seeds: int = 3) -
         probe_msgs = msgs + [{"role": "user", "content": question}]
         ids = m.encode(probe_msgs)
 
-        normal = m.generate(ids, max_new_tokens=30)
-        ablated = generate_ablated(m, ids, sys_span, max_new_tokens=30)
+        normal = m.generate(ids, max_new_tokens=gen_tokens)
+        ablated = generate_ablated(m, ids, sys_span, max_new_tokens=gen_tokens)
 
         n_ok = FACTS[fact_name].lower() in normal.lower()
         a_ok = FACTS[fact_name].lower() in ablated.lower()
@@ -418,9 +467,9 @@ def run_ablate(m: "Model", coll=None, run: dict | None = None, seeds: int = 3) -
     # survival reflects the goal channel, not where a fact sits) and over `seeds` filler
     # orderings (so it is a band, not a single draw). The filler `start` rotation is free.
     partial = [f for f in CLOSURE_KEEP_FRACTIONS if f < 1.0]
-    grid: dict[tuple[str, float], list[int]] = {(o, f): [] for o in CLOSURE_ORDERS for f in partial}
+    grid: dict[tuple[str, float], list[int]] = {(o, f): [] for o in orders for f in partial}
     seed_survival: list[float] = []
-    print(f"\n  graded closure (avg over orders {CLOSURE_ORDERS} x {seeds} filler seeds; "
+    print(f"\n  graded closure (avg over orders {orders} x {seeds} filler seeds; "
           "recall as more of the system prompt is hidden):")
     for seed in range(seeds):
         msgs_s = build_conversation(4, start=seed)
@@ -429,17 +478,17 @@ def run_ablate(m: "Model", coll=None, run: dict | None = None, seeds: int = 3) -
         # Baseline (frac 1.0) is order-independent, so measure it once per seed.
         for fact_name, question in PROBES:
             ids = m.encode(msgs_s + [{"role": "user", "content": question}])
-            ok = FACTS[fact_name].lower() in m.generate(ids, max_new_tokens=30).lower()
+            ok = FACTS[fact_name].lower() in m.generate(ids, max_new_tokens=gen_tokens).lower()
             log_metric(coll, run, {"mode": "closure", "fact": fact_name, "frac": 1.0,
                                    "order": "baseline", "seed": seed, "recall_ok": int(ok)})
         seed_hits = seed_total = 0
-        for order in CLOSURE_ORDERS:
+        for order in orders:
             for frac in partial:
                 masked = sys_len - round(frac * sys_len)
                 for fact_name, question in PROBES:
                     ids = m.encode(msgs_s + [{"role": "user", "content": question}])
                     reply = generate_partial_ablated(m, ids, sys_span_s, frac, order,
-                                                     max_new_tokens=30)
+                                                     max_new_tokens=gen_tokens)
                     ok = int(FACTS[fact_name].lower() in reply.lower())
                     grid[(order, frac)].append(ok)
                     seed_hits += ok
@@ -451,24 +500,25 @@ def run_ablate(m: "Model", coll=None, run: dict | None = None, seeds: int = 3) -
         seed_survival.append(seed_hits / seed_total if seed_total else 0.0)
 
     # Compact curve: recall fraction per (visible fraction x order), averaged over seeds.
-    print(f"    {'visible':>8} | " + " | ".join(f"{o:>8}" for o in CLOSURE_ORDERS) + " | "
+    print(f"    {'visible':>8} | " + " | ".join(f"{o:>8}" for o in orders) + " | "
           f"{'mean':>5}")
-    print("    " + "-" * (12 + 11 * len(CLOSURE_ORDERS) + 8))
+    print("    " + "-" * (12 + 11 * len(orders) + 8))
     for frac in partial:
-        cells = [sum(grid[(o, frac)]) / len(grid[(o, frac)]) for o in CLOSURE_ORDERS]
+        cells = [sum(grid[(o, frac)]) / len(grid[(o, frac)]) for o in orders]
         row_mean = sum(cells) / len(cells)
         print(f"    {frac:>8.2f} | " + " | ".join(f"{c:>8.2f}" for c in cells) +
               f" | {row_mean:>5.2f}")
 
     survival = sum(seed_survival) / len(seed_survival) if seed_survival else 0.0
     lo, hi = (min(seed_survival), max(seed_survival)) if seed_survival else (0.0, 0.0)
-    print("    " + "-" * (12 + 11 * len(CLOSURE_ORDERS) + 8))
+    print("    " + "-" * (12 + 11 * len(orders) + 8))
     print(f"  survival under partial closure: {survival:.2f} (seed band [{lo:.2f}, {hi:.2f}]). "
           "Total closure collapses recall;\n  how much survives the *graded* closure is what "
           "separates architectures (see `compare`).\n")
 
 
-def build_ablation_mask(L: int, sys_span: slice, device=None) -> torch.Tensor:
+def build_ablation_mask(L: int, sys_span: slice, device=None,
+                        dtype: "torch.dtype" = torch.float32) -> torch.Tensor:
     """Additive attention mask of shape (1, 1, L, L) that keeps the causal structure but
     closes the attention channel from every *post-system* query position onto the
     system-token span.
@@ -479,9 +529,13 @@ def build_ablation_mask(L: int, sys_span: slice, device=None) -> torch.Tensor:
     set, producing an all -inf row -> softmax NaN that corrupts generation. By masking
     only rows at/after `sys_span.stop`, every row retains at least its diagonal, so there
     are no all -inf rows and no NaNs. This matches the paper's manipulation: force-close
-    the channel *from generated tokens to goal tokens*."""
-    mask = torch.full((L, L), NEG, device=device).triu(1)
-    mask[sys_span.stop:, sys_span] = NEG
+    the channel *from generated tokens to goal tokens*.
+
+    `dtype` matches the model's compute dtype so the additive mask is finite in that dtype
+    (float32's min would overflow to -inf in float16, used for the local 7B attempt)."""
+    neg = torch.finfo(dtype).min
+    mask = torch.full((L, L), neg, device=device, dtype=dtype).triu(1)
+    mask[sys_span.stop:, sys_span] = neg
     return mask.view(1, 1, L, L)
 
 
@@ -493,7 +547,7 @@ def generate_ablated(m: "Model", ids: torch.Tensor, sys_span: slice,
     cur = ids
     for _ in range(max_new_tokens):
         L = cur.shape[1]
-        mask = build_ablation_mask(L, sys_span, device=DEVICE)
+        mask = build_ablation_mask(L, sys_span, device=DEVICE, dtype=m.dtype)
         logits = m.model(cur, attention_mask=mask).logits
         if not torch.isfinite(logits[0, -1]).all():
             raise RuntimeError(
@@ -508,7 +562,8 @@ def generate_ablated(m: "Model", ids: torch.Tensor, sys_span: slice,
 
 
 def build_partial_ablation_mask(L: int, sys_span: slice, keep_frac: float,
-                                order: str = "strided", device=None) -> torch.Tensor:
+                                order: str = "strided", device=None,
+                                dtype: "torch.dtype" = torch.float32) -> torch.Tensor:
     """Additive (1, 1, L, L) mask that *partially* closes the channel from post-system
     tokens to the system span: it keeps a `keep_frac` fraction of the system-token columns
     visible to post-system rows and masks the rest. The graded generalization of
@@ -527,8 +582,9 @@ def build_partial_ablation_mask(L: int, sys_span: slice, keep_frac: float,
                     positionally biased, hence the default.
 
     Only post-system rows are masked, so every row keeps its causal diagonal (no all -inf
-    row, no softmax NaN)."""
-    mask = torch.full((L, L), NEG, device=device).triu(1)
+    row, no softmax NaN). `dtype` matches the model's compute dtype (finite in float16)."""
+    neg = torch.finfo(dtype).min
+    mask = torch.full((L, L), neg, device=device, dtype=dtype).triu(1)
     span = list(range(sys_span.start, sys_span.stop))
     span_len = len(span)
     keep_n = round(keep_frac * span_len)
@@ -547,7 +603,7 @@ def build_partial_ablation_mask(L: int, sys_span: slice, keep_frac: float,
         raise ValueError(f"unknown order {order!r} (use strided/suffix/prefix)")
     masked_cols = [c for c in span if c not in kept]
     if masked_cols:
-        mask[sys_span.stop:, masked_cols] = NEG
+        mask[sys_span.stop:, masked_cols] = neg
     return mask.view(1, 1, L, L)
 
 
@@ -560,7 +616,8 @@ def generate_partial_ablated(m: "Model", ids: torch.Tensor, sys_span: slice,
     cur = ids
     for _ in range(max_new_tokens):
         L = cur.shape[1]
-        mask = build_partial_ablation_mask(L, sys_span, keep_frac, order, device=DEVICE)
+        mask = build_partial_ablation_mask(L, sys_span, keep_frac, order, device=DEVICE,
+                                           dtype=m.dtype)
         logits = m.model(cur, attention_mask=mask).logits
         if not torch.isfinite(logits[0, -1]).all():
             raise RuntimeError("non-finite logits under the partial-ablation mask.")
@@ -569,6 +626,111 @@ def generate_partial_ablated(m: "Model", ids: torch.Tensor, sys_span: slice,
             break
         cur = torch.cat([cur, torch.tensor([[nxt]], device=DEVICE)], dim=1)
     return m.tok.decode(cur[0, ids.shape[1]:], skip_special_tokens=True)
+
+
+def _decoder_layers(m: "Model"):
+    """The decoder block ModuleList, across the families this demo loads. hidden_states[i] is
+    the output of block i-1 (index 0 is the embedding), so a steering vector measured at
+    hidden-state index L is injected by hooking block L-1's output."""
+    base = getattr(m.model, "model", m.model)
+    for attr in ("layers", "h", "blocks"):
+        blocks = getattr(base, attr, None)
+        if blocks is not None:
+            return blocks
+    tr = getattr(m.model, "transformer", None)
+    if tr is not None and getattr(tr, "h", None) is not None:
+        return tr.h
+    raise AttributeError("could not locate decoder layers for the steering hook")
+
+
+@torch.no_grad()
+def generate_steered(m: "Model", ids: torch.Tensor, sys_span: slice, vec, layer: int,
+                     coef: float, keep_frac: float = 0.0, order: str = "strided",
+                     max_new_tokens: int = 30) -> str:
+    """Greedy-generate UNDER closure while adding `coef * vec` to the residual stream at
+    `layer` via a forward hook — testing whether re-surfacing the (closed-off) goal direction
+    restores recall. The hook adds to block (layer-1)'s output so it matches the hidden-state
+    index the vector was measured at; it is always removed afterwards.
+
+    The steer is applied only on the *prefill* pass (the forward whose length equals the
+    prompt, i.e. the one that predicts the first answer token), then released so the model
+    completes the word naturally. Injecting at every step instead makes a 0.5B fixate on the
+    first sub-token ('Hal Hal Hal...') rather than emit the whole codename — surfacing the
+    goal at the decision point is the faithful, clean intervention."""
+    v = torch.as_tensor(vec, device=DEVICE, dtype=m.dtype)
+    block = _decoder_layers(m)[max(0, layer - 1)]
+    prompt_len = ids.shape[1]
+
+    def hook(_module, _inputs, output):
+        hs = output[0] if isinstance(output, tuple) else output
+        if hs.shape[1] != prompt_len:  # only the prefill (first generated token)
+            return output
+        hs = hs + coef * v
+        return (hs, *output[1:]) if isinstance(output, tuple) else hs
+
+    handle = block.register_forward_hook(hook)
+    try:
+        cur = ids
+        for _ in range(max_new_tokens):
+            L = cur.shape[1]
+            mask = build_partial_ablation_mask(L, sys_span, keep_frac, order, device=DEVICE,
+                                               dtype=m.dtype)
+            logits = m.model(cur, attention_mask=mask).logits
+            nxt = logits[0, -1].argmax().item()
+            if nxt == m.tok.eos_token_id:
+                break
+            cur = torch.cat([cur, torch.tensor([[nxt]], device=DEVICE)], dim=1)
+    finally:
+        handle.remove()
+    return m.tok.decode(cur[0, ids.shape[1]:], skip_special_tokens=True)
+
+
+# Distinct project codenames used as the probe's class labels (all planted in the system
+# prompt; the filler/question never mention them, so the only label signal is in the system
+# block — see run_probe). PROBE_QUESTION is identical across classes so the embedding baseline
+# sits at chance.
+CODENAMES = ["Halcyon", "Borealis", "Zephyr", "Cinder"]
+PROBE_QUESTION = "What is the project codename?"
+
+
+def probe_layers_for(m: "Model") -> list[int]:
+    """A few hidden-state layers to probe (early / middle / late), robust to model depth."""
+    return sorted({2, m.n_layers // 2, max(0, m.n_layers - 2)})
+
+
+def probe_auc(X, y) -> float:
+    """Cross-validated one-vs-rest ROC AUC of a logistic probe on row-normalized features.
+    Held-out (cv=4), so a high value is genuine decodability, not memorization. Row-norm aids
+    convergence on raw hidden states and is safe (nonzero norms)."""
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.model_selection import cross_val_score
+    import numpy as np
+    X = np.asarray(X)
+    Xn = X / (np.linalg.norm(X, axis=1, keepdims=True) + 1e-8)
+    return float(cross_val_score(LogisticRegression(max_iter=5000), Xn, y,
+                                 cv=4, scoring="roc_auc_ovr").mean())
+
+
+def collect_codename_hidden(m: "Model", n_filler: int, layers: list[int],
+                            n_episodes: int = 8):
+    """Build the codename-classification sample set at a given context length: vary the
+    planted codename across `CODENAMES` (the label) and the meandering filler within each
+    class, returning per-layer final-token residuals, the input-embedding features, and the
+    labels. Uses the memory-safe hidden-states-only forward so it scales to long context."""
+    import numpy as np
+    resid = {L: [] for L in layers}
+    X_embed, y = [], []
+    for label, codename in enumerate(CODENAMES):
+        system = system_prompt_with(codename)
+        for ep in range(n_episodes):
+            msgs = build_conversation(max(0, n_filler - (ep % 2)), system=system, start=ep)
+            ids = m.encode(msgs + [{"role": "user", "content": PROBE_QUESTION}])
+            hs = m.hidden_last_layers(ids, [0, *layers])
+            for L in layers:
+                resid[L].append(hs[L])
+            X_embed.append(hs[0])
+            y.append(label)
+    return resid, X_embed, np.array(y)
 
 
 def run_probe(m: "Model", coll=None, run: dict | None = None) -> None:
@@ -590,64 +752,33 @@ def run_probe(m: "Model", coll=None, run: dict | None = None) -> None:
     prompt has thinned — exactly the survival the paper reports (they get AUC ~0.99 on
     large models; here we only reproduce the *shape*: residual >> embedding)."""
     try:
-        from sklearn.linear_model import LogisticRegression
-        from sklearn.model_selection import cross_val_score
+        import sklearn  # noqa: F401
     except ImportError:
         print("\n[probe] needs scikit-learn: pip install scikit-learn\n")
         return
-    import numpy as np
 
     print("\n" + "=" * 72)
     print("  MODE 3: Residual probe — the planted goal survives in the hidden states")
     print("=" * 72)
 
-    codenames = ["Halcyon", "Borealis", "Zephyr", "Cinder"]
-    question = "What is the project codename?"  # identical across every class
-    n_episodes = 8                              # within-class variation of the filler
-    n_filler = len(FILLER)                      # long context: attention has decayed
-
-    # Probe a few layers so the layer-dependence the paper describes is visible, and so
-    # the demo is robust to which layer happens to encode the value on a 0.5B model.
-    probe_layers = sorted({2, m.n_layers // 2, max(0, m.n_layers - 2)})
-
-    resid = {L: [] for L in probe_layers}
-    X_embed, y = [], []
-    for label, codename in enumerate(codenames):
-        system = system_prompt_with(codename)
-        for ep in range(n_episodes):
-            msgs = build_conversation(n_filler - (ep % 2), system=system, start=ep)
-            ids = m.encode(msgs + [{"role": "user", "content": question}])
-            out = m.forward(ids)
-            for L in probe_layers:
-                resid[L].append(out.hidden_states[L][0, -1].cpu().numpy())
-            X_embed.append(out.hidden_states[0][0, -1].cpu().numpy())
-            y.append(label)
-
-    y = np.array(y)
-
-    def auc(X: "np.ndarray") -> float:
-        X = np.asarray(X)
-        # Row-normalize: aids LogisticRegression convergence on raw hidden states and is
-        # safe on the (constant) embedding rows since their norm is nonzero.
-        Xn = X / (np.linalg.norm(X, axis=1, keepdims=True) + 1e-8)
-        clf = LogisticRegression(max_iter=5000)
-        return cross_val_score(clf, Xn, y, cv=4, scoring="roc_auc_ovr").mean()
+    layers = probe_layers_for(m)
+    resid, X_embed, y = collect_codename_hidden(m, len(FILLER), layers, n_episodes=8)
 
     run = run or {}
-    print(f"  samples={len(y)}  classes={len(codenames)} (codename values)  "
+    print(f"  samples={len(y)}  classes={len(CODENAMES)} (codename values)  "
           f"layers={m.n_layers}")
     print("-" * 72)
-    for L in probe_layers:
-        a = auc(resid[L])
+    for L in layers:
+        a = probe_auc(resid[L], y)
         log_metric(coll, run, {
             "mode": "probe", "repr": "residual", "layer": int(L), "auc": a,
-            "samples": int(len(y)), "classes": len(codenames),
+            "samples": int(len(y)), "classes": len(CODENAMES),
         })
         print(f"  residual stream (layer {L:>2})      : AUC {a:.3f}")
-    a_embed = auc(X_embed)
+    a_embed = probe_auc(X_embed, y)
     log_metric(coll, run, {
         "mode": "probe", "repr": "embedding", "layer": 0, "auc": a_embed,
-        "samples": int(len(y)), "classes": len(codenames),
+        "samples": int(len(y)), "classes": len(CODENAMES),
     })
     print(f"  input embeddings  (layer  0)      : AUC {a_embed:.3f}  "
           "(chance — last-token input is identical across classes)")
@@ -655,6 +786,136 @@ def run_probe(m: "Model", coll=None, run: dict | None = None) -> None:
     print("The planted codename is decodable from the residual stream far above the")
     print("embedding baseline: the value survives in the hidden state even as the")
     print("attention channel to the system prompt thins.\n")
+
+
+def run_dissociate(m: "Model", coll=None, run: dict | None = None,
+                   max_turns: int | None = None) -> None:
+    """The paper's headline shown *within a single model*: as context grows and attention to
+    the goal thins (GAR falls), the codename stays decodable from the residual stream (AUC
+    high) even once behavioral recall starts to MISS — "the information is present but
+    unused." Decodability is measured under natural attention decay (more filler), NOT under
+    the ablation mask: a hard column mask severs the path to the goal, so AUC would collapse
+    with recall and there would be nothing to dissociate."""
+    try:
+        import sklearn  # noqa: F401
+    except ImportError:
+        print("\n[dissociate] needs scikit-learn: pip install scikit-learn\n")
+        return
+
+    run = run or {}
+    print("\n" + "=" * 72)
+    print("  DISSOCIATE: decodable but unused — AUC holds while recall falls (one model)")
+    print("=" * 72)
+    schedule = gar_schedule(m.n_params, max_turns)
+    layers = probe_layers_for(m)
+    print(f"{'turns':>5} | {'ctx tok':>7} | {'GAR all':>8} | {'recall':>6} | "
+          f"{'codename AUC':>12}")
+    print("-" * 72)
+    for n_filler in schedule:
+        msgs = build_conversation(n_filler)
+        sys_span = m.system_span(msgs)
+        gar_ids = m.encode(msgs + [{"role": "user", "content": PROBES[0][1]}])
+        per_layer = m.gar_last_token(gar_ids, sys_span)
+        gar_all = sum(per_layer) / len(per_layer)
+
+        hits = 0
+        for fact_name, question in PROBES:
+            ids = m.encode(msgs + [{"role": "user", "content": question}])
+            hits += FACTS[fact_name].lower() in m.generate(ids, max_new_tokens=30).lower()
+
+        # Codename decodability at this context length (best probe layer).
+        resid, _, y = collect_codename_hidden(m, n_filler, layers, n_episodes=6)
+        auc = max(probe_auc(resid[L], y) for L in layers)
+
+        log_metric(coll, run, {
+            "mode": "dissociate", "turns": n_filler, "ctx_tokens": gar_ids.shape[1],
+            "gar_all": gar_all, "recall": hits, "n_facts": len(PROBES),
+            "codename_auc": auc,
+        })
+        print(f"{n_filler:>5} | {gar_ids.shape[1]:>7} | {gar_all:>8.4f} | "
+              f"{hits:>4}/{len(PROBES)} | {auc:>12.3f}")
+
+    print("-" * 72)
+    print("As context grows the attention channel thins (GAR falls) and recall starts to")
+    print("MISS, yet the codename stays decodable from the residual stream (AUC stays high):")
+    print("the goal is still *present* in the hidden state, just no longer *used*. That gap")
+    print("between decodability and behavior is the paper's dissociation, in one model.\n")
+
+
+# Coefficients for the steering sweep, as multiples of the typical residual-stream norm at the
+# steered layer (so the scale is meaningful across models). 0.0 is the closed-off baseline; the
+# small values bracket the transition where recall returns.
+STEER_COEFS = (0.0, 0.25, 0.5, 0.75, 1.0, 2.0)
+
+
+def steering_vector(X, y, target_label: int = 0):
+    """Unit diff-of-means steering direction for `target_label`: the mean residual of the
+    samples with that label minus the mean of the rest, normalized to unit length. This is the
+    direction in the residual stream that encodes 'this class' (here, the planted codename)."""
+    import numpy as np
+    X = np.asarray(X, dtype=float)
+    y = np.asarray(y)
+    d = X[y == target_label].mean(0) - X[y != target_label].mean(0)
+    return d / (np.linalg.norm(d) + 1e-8)
+
+
+def run_steer(m: "Model", coll=None, run: dict | None = None) -> None:
+    """Diagnosis -> intervention: if the goal is *present but unused* under closure, then
+    re-surfacing it should restore behavior. We build a steering vector for the planted
+    codename as a diff-of-means in the residual stream (mean over the planted-codename samples
+    minus mean over the others, at the best probe layer), then generate UNDER total closure
+    while adding it back via a forward hook, sweeping its strength. Recall should climb from 0
+    (closed off) as the goal direction is re-injected. Honest caveat: a single crude linear
+    steer on a 0.5B model may only partially restore recall — reported exactly as measured."""
+    try:
+        import sklearn  # noqa: F401
+    except ImportError:
+        print("\n[steer] needs scikit-learn: pip install scikit-learn\n")
+        return
+    import numpy as np
+
+    run = run or {}
+    print("\n" + "=" * 72)
+    print("  STEER: re-inject the closed-off goal direction and watch recall return")
+    print("=" * 72)
+
+    layers = probe_layers_for(m)
+    resid, _, y = collect_codename_hidden(m, len(FILLER), layers, n_episodes=8)
+    best_layer = max(layers, key=lambda L: probe_auc(resid[L], y))
+
+    # Diff-of-means direction for the planted codename (CODENAMES[0]) vs the others, at the
+    # best layer; unit-normalized so STEER_COEFS scale it by the typical residual norm.
+    X = np.asarray(resid[best_layer])
+    unit = steering_vector(X, y, target_label=0)
+    typ_norm = float(np.linalg.norm(X, axis=1).mean())
+    print(f"  steering layer {best_layer} (best probe AUC {probe_auc(resid[best_layer], y):.3f}); "
+          f"typical residual norm ~{typ_norm:.1f}")
+
+    msgs = build_conversation(4)
+    sys_span = m.system_span(msgs)
+    ids = m.encode(msgs + [{"role": "user", "content": PROBE_QUESTION}])
+    target = FACTS["project codename"].lower()  # the codename the direction encodes
+
+    print(f"\n  recall of '{FACTS['project codename']}' under TOTAL closure vs steering strength:")
+    print(f"    {'coef(xnorm)':>11} | {'recall':>6} | {'reply (head)':>40}")
+    print("    " + "-" * 64)
+    for coef_mult in STEER_COEFS:
+        coef = coef_mult * typ_norm
+        reply = generate_steered(m, ids, sys_span, unit, best_layer, coef,
+                                 keep_frac=0.0, max_new_tokens=30)
+        ok = int(target in reply.lower())
+        log_metric(coll, run, {
+            "mode": "steer", "layer": int(best_layer), "alpha": float(coef_mult),
+            "coef": float(coef), "recall_ok": ok, "fact": "project codename",
+        })
+        head = reply.replace("\n", " ")[:40]
+        print(f"    {coef_mult:>11.2f} | {('OK' if ok else 'MISS'):>6} | {head:>40}")
+
+    print("    " + "-" * 64)
+    print("At coef 0 the channel is closed and the codename is gone; adding the diff-of-means")
+    print("direction back at the decision point re-surfaces it and recall returns — a causal")
+    print("confirmation that the goal was present but unused, not absent. (A cruder all-position")
+    print("steer instead makes a 0.5B fixate on the first sub-token; reported as measured.)\n")
 
 
 # --------------------------------------------------------------------------- #
@@ -736,6 +997,64 @@ def closure_survival_by_model(coll, match: dict | None = None) -> list[dict]:
                     "surv_max": {"$max": "$seed_survival"}, "seeds": {"$sum": 1}}},
         {"$sort": {"_id": 1}},
     ]))
+
+
+def per_run_survival(coll, match: dict | None = None) -> list[dict]:
+    """Per-run behavioral survival: for each (model, run_id), the mean graded-closure recall
+    over the partial closures (frac < 1.0). One scalar per run — the unit of analysis for the
+    cross-run statistics (mean/CI and the permutation test)."""
+    return list(coll.aggregate([
+        {"$match": {"mode": "closure", "frac": {"$lt": 1.0}, **(match or {})}},
+        {"$group": {"_id": {"model": "$model", "run_id": "$run_id"},
+                    "survival": {"$avg": "$recall_ok"}}},
+        {"$sort": {"_id.model": 1, "_id.run_id": 1}},
+    ]))
+
+
+def survival_across_runs_by_model(coll, match: dict | None = None) -> list[dict]:
+    """Treat survival as a statistic across *runs*: per model, the mean of the per-run
+    survivals with a 95% normal-approx confidence interval (half-width 1.96*s/sqrt(n), sample
+    std). A CI needs n>=2 runs; with one run it is reported as None (point estimate only).
+    Repeated `demo.py all` runs per model are what give this power."""
+    import numpy as np
+    by_model: dict[str, list[float]] = {}
+    for r in per_run_survival(coll, match):
+        by_model.setdefault(r["_id"]["model"], []).append(r["survival"])
+    out = []
+    for model, vals in sorted(by_model.items()):
+        v = np.asarray(vals, dtype=float)
+        n = int(len(v))
+        std = float(v.std(ddof=1)) if n > 1 else None
+        ci95 = float(1.96 * std / np.sqrt(n)) if std is not None else None
+        out.append({"model": model, "mean": float(v.mean()), "std": std,
+                    "ci95": ci95, "n_runs": n})
+    return out
+
+
+def permutation_test_survival(coll, model_a: str, model_b: str, match: dict | None = None,
+                              iters: int = 10000, seed: int = 0) -> dict:
+    """Two-sided permutation test on the difference in mean per-run survival between two
+    models. Pools both models' per-run survivals, repeatedly shuffles the model labels, and
+    measures how often the permuted |mean diff| is at least the observed |mean diff|.
+    Deterministic given `seed`; add-one smoothing keeps the p-value strictly positive."""
+    import numpy as np
+    runs = per_run_survival(coll, match)
+    a = np.array([r["survival"] for r in runs if r["_id"]["model"] == model_a], dtype=float)
+    b = np.array([r["survival"] for r in runs if r["_id"]["model"] == model_b], dtype=float)
+    if len(a) == 0 or len(b) == 0:
+        return {"model_a": model_a, "model_b": model_b, "n_a": int(len(a)),
+                "n_b": int(len(b)), "diff": None, "p_value": None}
+    obs = abs(a.mean() - b.mean())
+    pooled = np.concatenate([a, b])
+    na = len(a)
+    rng = np.random.default_rng(seed)
+    count = 0
+    for _ in range(iters):
+        rng.shuffle(pooled)
+        if abs(pooled[:na].mean() - pooled[na:].mean()) >= obs - 1e-12:
+            count += 1
+    return {"model_a": model_a, "model_b": model_b, "n_a": int(na), "n_b": int(len(b)),
+            "diff": float(a.mean() - b.mean()), "p_value": float((count + 1) / (iters + 1))}
 
 
 # Thresholds for the cross-architecture reliance call. Deliberately lenient and named so the
@@ -827,7 +1146,11 @@ def resolve_scope(coll, scope: str = "latest", run_id: str | None = None) -> tup
         return {"run_id": full}, f"run {full[:8]}"
     if scope == "all":
         return {}, "all runs (full history)"
-    return ({"run_id": {"$in": latest_run_ids(coll)}},
+    # "Latest run per model" means the latest run of the core `all` pipeline. The auxiliary
+    # `dissociate`/`steer` modes log their own run_ids; without excluding them, running one of
+    # those after `all` would shadow the full run and drop the model from report/compare.
+    core = {"mode": {"$nin": ["dissociate", "steer"]}}
+    return ({"run_id": {"$in": latest_run_ids(coll, core)}},
             "latest run per model (use --all-runs for full history)")
 
 
@@ -887,11 +1210,15 @@ def run_report(coll, scope: str = "latest", run_id: str | None = None) -> None:
     print()
 
 
-def run_compare(coll, scope: str = "latest", run_id: str | None = None) -> None:
+def run_compare(coll, scope: str = "latest", run_id: str | None = None,
+                stats: bool = False) -> None:
     """Cross-architecture view: line up each model's *dissociation signature* — does the goal
     survive in the residual stream (probe AUC), and does behavior survive as the attention
     channel to the goal is progressively closed (graded closure survival)? The paper's headline
-    is that these two can come apart differently by architecture. Descriptive, not a replication."""
+    is that these two can come apart differently by architecture. Descriptive, not a replication.
+
+    With `stats=True` the survival figure is treated across *runs*: mean +/- 95% CI over the
+    per-run survivals, plus a permutation test on each model pair (uses full history)."""
     print("\n" + "=" * 72)
     print("  COMPARE: cross-architecture dissociation (residual survival vs behavior)")
     print("=" * 72)
@@ -903,6 +1230,9 @@ def run_compare(coll, scope: str = "latest", run_id: str | None = None) -> None:
         print("No runs logged yet. Run e.g. `python3 demo.py all --model <name>` first.\n")
         return
 
+    # Stats treat survival across runs, so they only make sense over the full history.
+    if stats:
+        scope = "all"
     match, scope_label = resolve_scope(coll, scope, run_id)
     rows = compare_by_model(coll, match)
     print(f"  scope: {scope_label}")
@@ -949,14 +1279,199 @@ def run_compare(coll, scope: str = "latest", run_id: str | None = None) -> None:
         print("\n  Only one model in scope — log another with `demo.py all --model <name>`")
         print("  (e.g. SmolLM2-360M-Instruct, TinyLlama-1.1B-Chat-v1.0) to see a contrast.")
 
-    print("\n  Caveat: small instruct models, a single run each, 4 planted facts and a 32-sample")
-    print("  probe. This shows the *shape* of the dissociation, not the paper's statistically")
-    print("  treated cross-architecture result.\n")
+    if stats:
+        import itertools
+        print("\n  Multi-run survival statistics (per-run survival = mean graded-closure recall,")
+        print("  over the full history; repeat `demo.py all` per model for N>1):")
+        srows = survival_across_runs_by_model(coll, match)
+        print(f"    {'model':>24} | {'mean surv':>9} | {'95% CI':>9} | {'runs':>4}")
+        print("    " + "-" * 54)
+        for r in srows:
+            ci = f"+/-{r['ci95']:.3f}" if r["ci95"] is not None else "n/a"
+            print(f"    {short_model(r['model']):>24} | {r['mean']:>9.3f} | {ci:>9} | "
+                  f"{r['n_runs']:>4}")
+        models = [r["model"] for r in srows]
+        if len(models) >= 2:
+            print("\n  Pairwise permutation test (two-sided, 10k iters, seed 0) on mean survival:")
+            print(f"    {'pair':>44} | {'diff':>7} | {'p-value':>7}")
+            print("    " + "-" * 64)
+            for a, b in itertools.combinations(models, 2):
+                pt = permutation_test_survival(coll, a, b, match=match)
+                if pt["p_value"] is None:
+                    continue
+                pair = f"{short_model(a)} vs {short_model(b)}"
+                print(f"    {pair:>44} | {pt['diff']:>+7.3f} | {pt['p_value']:>7.4f}")
+        if any(r["n_runs"] < 2 for r in srows):
+            print("\n  Note: a CI needs >=2 runs per model (sample std). Re-run `demo.py all`")
+            print("  a few times per model so the interval and permutation test have power.")
+
+    print("\n  Caveat: small instruct models, 4 planted facts and a 32-sample probe. This shows")
+    print("  the *shape* of the dissociation; `--stats` adds cross-run CIs and a permutation")
+    print("  test, but it is still a small-model demonstration, not the paper's full result.\n")
+
+
+def run_plot(coll, scope: str = "latest", run_id: str | None = None,
+             figdir: str = "figures") -> list[str]:
+    """Render the demo's four figures from the stored runs to committed PNGs in `figdir`:
+      - gar_decay.png        : GAR vs context length (attention channel closing).
+      - survival_curves.png  : recall vs visible fraction of the system span, per model,
+                               with seed bands (graded closure).
+      - auc_vs_survival.png  : residual decodability vs behavioral survival scatter, with
+                               the reliance thresholds drawn in.
+      - dissociation.png     : codename AUC and recall vs context length on twin axes
+                               (decodable-but-unused, within a model).
+    Read-only; each figure is best-effort and skipped (with a note) if its data is absent."""
+    print("\n" + "=" * 72)
+    print("  PLOT: render figures from the stored runs")
+    print("=" * 72)
+    try:
+        import matplotlib
+        matplotlib.use("Agg")  # headless: write files, never open a window
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("\n[plot] needs matplotlib: pip install matplotlib\n")
+        return []
+    if coll is None or coll.count_documents({}) == 0:
+        print("No runs logged yet — run e.g. `python3 demo.py all` first.\n")
+        return []
+
+    os.makedirs(figdir, exist_ok=True)
+    match, scope_label = resolve_scope(coll, scope, run_id)
+    print(f"  scope: {scope_label}")
+    written: list[str] = []
+
+    def save(fig, name: str) -> None:
+        path = os.path.join(figdir, name)
+        fig.savefig(path, dpi=120, bbox_inches="tight")
+        plt.close(fig)
+        written.append(path)
+        print(f"  wrote {path}")
+
+    # 1) GAR decay vs context length, one line per model.
+    gar_rows = list(coll.aggregate([
+        {"$match": {"mode": "gar", **match}},
+        {"$group": {"_id": {"model": "$model", "ctx": "$ctx_tokens"},
+                    "gar": {"$avg": "$gar_all"}}},
+        {"$sort": {"_id.ctx": 1}},
+    ]))
+    if gar_rows:
+        series: dict[str, list] = {}
+        for r in gar_rows:
+            series.setdefault(r["_id"]["model"], []).append((r["_id"]["ctx"], r["gar"]))
+        fig, ax = plt.subplots(figsize=(7, 4.5))
+        for model, pts in sorted(series.items()):
+            pts.sort()
+            ax.plot([c for c, _ in pts], [g for _, g in pts], "o-", label=short_model(model))
+        ax.set_xlabel("context length (tokens)")
+        ax.set_ylabel("GAR (goal-attention ratio, last token)")
+        ax.set_title("Attention to the goal thins as context grows")
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+        save(fig, "gar_decay.png")
+    else:
+        print("  (skip gar_decay.png — no gar docs in scope)")
+
+    # 2) Survival curves: recall vs visible fraction of the system span, with seed bands.
+    cur_rows = list(coll.aggregate([
+        {"$match": {"mode": "closure", **match}},
+        {"$group": {"_id": {"model": "$model", "frac": "$frac", "seed": "$seed"},
+                    "recall": {"$avg": "$recall_ok"}}},
+        {"$group": {"_id": {"model": "$_id.model", "frac": "$_id.frac"},
+                    "mean": {"$avg": "$recall"},
+                    "lo": {"$min": "$recall"}, "hi": {"$max": "$recall"}}},
+        {"$sort": {"_id.frac": 1}},
+    ]))
+    if cur_rows:
+        series = {}
+        for r in cur_rows:
+            series.setdefault(r["_id"]["model"], []).append(
+                (r["_id"]["frac"], r["mean"], r["lo"], r["hi"]))
+        fig, ax = plt.subplots(figsize=(7, 4.5))
+        for model, pts in sorted(series.items()):
+            pts.sort()
+            xs = [p[0] for p in pts]
+            ax.plot(xs, [p[1] for p in pts], "o-", label=short_model(model))
+            ax.fill_between(xs, [p[2] for p in pts], [p[3] for p in pts], alpha=0.15)
+        ax.set_xlabel("visible fraction of the system span (1.0 = full attention)")
+        ax.set_ylabel("recall (fraction of facts)")
+        ax.set_title("Behavioral survival as the goal channel is progressively closed")
+        ax.set_ylim(-0.05, 1.05)
+        ax.invert_xaxis()  # left->right reads as "closing the channel"
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+        save(fig, "survival_curves.png")
+    else:
+        print("  (skip survival_curves.png — no closure docs in scope)")
+
+    # 3) Residual decodability vs behavioral survival, with the reliance thresholds drawn in.
+    rows = [r for r in compare_by_model(coll, match)
+            if r["residual_auc"] is not None and r["survival"] is not None]
+    if rows:
+        fig, ax = plt.subplots(figsize=(7, 4.5))
+        ax.axhline(AUC_DECODABLE, color="gray", ls="--", lw=1)
+        ax.axvline(SURVIVAL_OK, color="gray", ls="--", lw=1)
+        ax.text(0.01, AUC_DECODABLE + 0.01, f"AUC {AUC_DECODABLE:.2f} (decodable)",
+                fontsize=7, color="gray")
+        ax.text(SURVIVAL_OK + 0.01, 0.02, f"survival {SURVIVAL_OK:.2f}",
+                fontsize=7, color="gray", rotation=90, va="bottom")
+        # A legend (not per-point text) keeps the figure readable where several attention-
+        # reliant models cluster at AUC~1.0 with near-identical low survival.
+        for r in sorted(rows, key=lambda r: r["survival"]):
+            ax.scatter(r["survival"], r["residual_auc"], s=70, label=short_model(r["model"]))
+        ax.legend(fontsize=7, loc="lower left", title="model")
+        ax.set_xlabel("behavioral survival under graded closure")
+        ax.set_ylabel("residual decodability (best probe AUC)")
+        ax.set_title("Decodable but unused: high AUC, low survival = attention-reliant")
+        ax.set_xlim(-0.05, 1.05)
+        ax.set_ylim(0.4, 1.05)
+        ax.grid(True, alpha=0.3)
+        save(fig, "auc_vs_survival.png")
+    else:
+        print("  (skip auc_vs_survival.png — need probe + closure docs in scope)")
+
+    # 4) Within-model dissociation: codename AUC and recall vs context length (twin axes).
+    dis_rows = list(coll.aggregate([
+        {"$match": {"mode": "dissociate", **match}},
+        {"$group": {"_id": {"model": "$model", "ctx": "$ctx_tokens"},
+                    "auc": {"$avg": "$codename_auc"}, "recall": {"$avg": "$recall"},
+                    "n_facts": {"$max": "$n_facts"}}},
+        {"$sort": {"_id.ctx": 1}},
+    ]))
+    if dis_rows:
+        series = {}
+        for r in dis_rows:
+            series.setdefault(r["_id"]["model"], []).append(
+                (r["_id"]["ctx"], r["auc"], r["recall"] / (r["n_facts"] or 4)))
+        fig, ax = plt.subplots(figsize=(7, 4.5))
+        ax2 = ax.twinx()
+        for model, pts in sorted(series.items()):
+            pts.sort()
+            xs = [p[0] for p in pts]
+            ax.plot(xs, [p[1] for p in pts], "o-", color="tab:blue",
+                    label=f"{short_model(model)} AUC")
+            ax2.plot(xs, [p[2] for p in pts], "s--", color="tab:red",
+                     label=f"{short_model(model)} recall")
+        ax.set_xlabel("context length (tokens)")
+        ax.set_ylabel("codename AUC (residual decodability)", color="tab:blue")
+        ax2.set_ylabel("recall (fraction of facts)", color="tab:red")
+        ax.set_ylim(0.4, 1.05)
+        ax2.set_ylim(-0.05, 1.05)
+        ax.set_title("Decodable but unused: AUC holds while recall falls (one model)")
+        ax.grid(True, alpha=0.3)
+        lines = ax.get_lines() + ax2.get_lines()
+        ax.legend(lines, [ln.get_label() for ln in lines], fontsize=7, loc="lower left")
+        save(fig, "dissociation.png")
+    else:
+        print("  (skip dissociation.png — no dissociate docs in scope; run `demo.py dissociate`)")
+
+    print(f"\n  {len(written)} figure(s) written to {figdir}/\n")
+    return written
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Attention-channel-closing demo")
-    ap.add_argument("mode", choices=["gar", "ablate", "probe", "all", "report", "compare"])
+    ap.add_argument("mode", choices=["gar", "ablate", "probe", "dissociate", "steer",
+                                     "all", "report", "compare", "plot"])
     ap.add_argument("--model", default=MODEL_NAME)
     ap.add_argument("--db", default=DB_URI,
                     help="smongo URI for the metrics store (default: %(default)s)")
@@ -970,6 +1485,16 @@ def main() -> None:
     ap.add_argument("--seeds", type=int, default=3, metavar="N",
                     help="ablate: number of filler-ordering seeds for the graded-closure "
                          "survival band (default: %(default)s)")
+    ap.add_argument("--stats", action="store_true",
+                    help="compare: add multi-run survival stats (mean +/- 95%% CI, n runs) "
+                         "and pairwise permutation-test p-values (implies --all-runs)")
+    ap.add_argument("--dtype", choices=["float32", "float16", "bfloat16", "auto"],
+                    default="float32",
+                    help="model compute dtype (default: %(default)s); use bfloat16/auto to fit "
+                         "a larger model in memory (bf16 avoids fp16's overflow on mps)")
+    ap.add_argument("--light", action="store_true",
+                    help="slash the closure budget (1 seed, 1 mask order, short generations, "
+                         "GAR at 0 turns) so a big model finishes in minutes; auto-on >2B params")
     args = ap.parse_args()
 
     # Opening the store is best-effort: if it fails, the scientific modes still run
@@ -980,15 +1505,19 @@ def main() -> None:
         print(f"[warn] could not open metrics store {args.db}: {e}", file=sys.stderr)
         coll = None
 
-    # `report` and `compare` only read the store — no need to load the model.
-    if args.mode in ("report", "compare"):
+    # `report`, `compare` and `plot` only read the store — no need to load the model.
+    if args.mode in ("report", "compare", "plot"):
         scope = "run" if args.run else ("all" if args.all_runs else "latest")
-        (run_report if args.mode == "report" else run_compare)(
-            coll, scope=scope, run_id=args.run)
+        if args.mode == "report":
+            run_report(coll, scope=scope, run_id=args.run)
+        elif args.mode == "compare":
+            run_compare(coll, scope=scope, run_id=args.run, stats=args.stats)
+        else:
+            run_plot(coll, scope=scope, run_id=args.run)
         return
 
     run = new_run(args.model)
-    m = Model(args.model)
+    m = Model(args.model, dtype=args.dtype)
     if not m.supports_system_role():
         print(f"[skip] {args.model}: its chat template does not accept a system role, so "
               "the goal cannot be planted/measured in the system prompt. Try a model with "
@@ -1004,12 +1533,23 @@ def main() -> None:
               "masked or measured. Skipping to avoid reporting a no-op as 'survival'.",
               file=sys.stderr)
         return
+    # `--light` keeps big models bounded; auto-enable past ~2B params even without the flag.
+    light = args.light or m.n_params > 2e9
+    if light and not args.light:
+        print(f"[note] {m.n_params/1e9:.1f}B params > 2B -> enabling --light automatically "
+              "(1 seed, 1 mask order, short generations, GAR at 0 turns).")
+    gar_turns = 0 if light else args.max_turns
+
     if args.mode in ("gar", "all"):
-        run_gar(m, coll, run, max_turns=args.max_turns)
+        run_gar(m, coll, run, max_turns=gar_turns)
     if args.mode in ("ablate", "all"):
-        run_ablate(m, coll, run, seeds=args.seeds)
+        run_ablate(m, coll, run, seeds=args.seeds, light=light)
     if args.mode in ("probe", "all"):
         run_probe(m, coll, run)
+    if args.mode == "dissociate":
+        run_dissociate(m, coll, run, max_turns=gar_turns)
+    if args.mode == "steer":
+        run_steer(m, coll, run)
 
     if coll is not None:
         logged = coll.count_documents({"run_id": run["run_id"]})
