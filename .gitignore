@@ -216,3 +216,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Embedded smongo metrics store (created by demo.py)
+lost_track_db/
+lost_track_db

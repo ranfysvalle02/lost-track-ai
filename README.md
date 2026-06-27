@@ -1,103 +1,245 @@
 # lost-track-ai
 
----
+A small, laptop-runnable demo that reproduces the *shape* of the three central findings
+from **"When Attention Closes: How LLMs Lose the Thread in Multi-Turn Interaction"**
+(Dongre, Hsieh, Lai, Yoon, Bui, Hakkani-Tür — [arXiv:2605.12922](https://arxiv.org/abs/2605.12922)).
 
-# The Closing Eye: Why LLMs "Lose the Thread" in Long Conversations (And How to Fix It)
+The point is not to match the paper's numbers. It is to make the paper's *mechanisms*
+something you can watch happen on a 0.5B model by reading the model internals directly
+(attention matrices and hidden states), rather than treating the model as a black box.
 
-Imagine hiring a world-class executive assistant. On day one, you hand them a comprehensive company handbook: *Maintain a strict, professional persona; never disclose internal financial thresholds; and cross-reference every single fact.*
-
-For the first few hours, they are flawless. But by mid-afternoon—after a relentless flurry of back-and-forth discussions—something breaks. They start speaking informally, inadvertently leak a protected figure, and completely hallucinate a piece of data.
-
-This is the curse of the long-context Large Language Model (LLM), known technically as **context drift**. An LLM starts an interaction with laser-focused adherence to your system prompt, only to gradually degrade into rule-breaking and role-breaking as the conversation extends across multiple turns. Until now, the AI community viewed this digital amnesia as an elusive, inevitable quirk of deep learning.
-
-However, a groundbreaking paper from Vardhan Dongre, Joseph Hsieh, Viet Dac Lai, Seunghyun Yoon, Trung Bui, and Dilek Hakkani-Tür (**arXiv: 2605.12922**) has cracked open the black box. The researchers proved that models don’t randomly wander off course—they cross a highly predictable, mathematical threshold where their internal architecture fundamentally shifts how it processes information.
-
----
-
-### Explanation: The Tale of Two Channels
-
-To explain why LLMs lose their way, the authors introduce a mechanistic framework called the **Channel-Transition Account**.
-
-When an LLM processes a multi-turn conversation, it routes your initial instructions down two distinct internal communication highways:
-
-1. **The Attention Channel:** Think of this as the model's *direct line of sight*. It uses explicit attention allocation to physically look back at the original system prompt tokens, directly copying and matching the constraints you established.
-2. **The Residual Stream Channel:** Think of this as the model's *internal muscle memory*. Instead of looking back at the raw text, the model relies on latent task representations that were written into its hidden layer states during earlier processing steps.
-
-As a conversation grows longer, a brutal mathematical reality sets in. The attention mass allocated to the initial system prompt tokens doesn't remain stable. It drifts, thins out, and eventually drops below a critical threshold.
-
-When this happens, the **Attention Channel effectively closes**. The model is suddenly blinded to its original text instructions. To survive, it must rely entirely on whatever latent signal has managed to endure inside its hidden residual stream. If the architecture struggles to propagate that latent signal forward, the model completely "loses the thread."
+For a detailed, instrument-by-instrument mapping between this demo and the paper (and an
+honest account of what it does and does not replicate), see [PAPER.md](PAPER.md).
 
 ---
 
-### Demonstration: The Smoking Gun (AUC 0.99)
+## What the paper says (in brief)
 
-How did the research team prove this invisible transition? They developed three diagnostic instruments to peer into the neural networks during extended interactions:
+Over long multi-turn conversations, models tend to drift away from their system prompt:
+they break persona, drop constraints, and misremember planted facts. The paper offers a
+mechanistic account rather than just a behavioral measurement:
 
-* **Goal Accessibility Ratio (GAR):** A metric that calculates the precise attention mass mapped from newly generated tokens back to the task-defining system tokens.
-* **Sliding-Window Attention Ablations:** A causal manipulation where researchers forcefully blocked the attention channel at specific intervals, blinding the model to see how its behavior changed.
-* **Linear Residual-Stream Probes:** Specialized probing classifiers trained to read the model's internal hidden layers to see if the rules were still recorded somewhere inside the network.
-
-The discoveries were staggering.
-
-When the authors forcefully blocked the attention channel in Mistral, fact-recall performance collapsed from near-perfect down to a abysmal **11% on a 20-fact retention test**. Simultaneously, persona-constraint violations spiked catastrophically—even without any adversarial pressure from the user. Crucially, this collapse occurred precisely at the "crossover turn" where the model's attention channel naturally closes.
-
-But here is the mind-blowing twist: **The model didn't actually forget the rules.**
-
-When the researchers ran linear probes on the residual stream, they discovered they could recover the task-relevant facts and behavioral rules with an accuracy of up to **0.99 AUC** across four primary model architectures. The rules were fully intact, deeply processed, and actively stored in the network's internal layers (emerging anywhere from Layer 2 to Layer 27 depending on the model).
-
-The AI still knew the rules perfectly; it just could no longer use its attention channel to pull those rules forward into its active text output.
-
----
-
-### Payoff: Unlocking the Enterprise Value
-
-If you are building AI agents, multi-turn copilots, or enterprise-grade chatbots, this paper is your tactical map. It transforms a frustrating, unpredictable product flaw into an addressable engineering problem. Here is how you can leverage these insights to build superior AI systems:
-
-#### 1. Move from "Vibe-Checking" to Deterministic Audits
-
-Instead of running endless, expensive prompt-engineering cycles hoping your model won't break on turn 20, you can use the **Goal Accessibility Ratio (GAR)** as a hard telemetry metric. By monitoring GAR in production, you can flag exactly when an agent’s attention channel is closing *before* it hallucinates or breaks persona.
-
-#### 2. Architect Smarter Context Management
-
-Because we now know that the rules survive in the residual stream but fail to guide token generation due to attention decay, standard long-context windows won't save you. This insights mathematically validates advanced context strategies, such as **dynamic system prompt reinjection** or **context hydration**, right before the model hits its architectural crossover turn.
-
-#### 3. Select Models Based on Structural Survival, Not Parameter Hype
-
-The paper reveals that architecture dictates survival. Some models maintain goal-conditioned behavior perfectly even when their attention channel closes, while others fail entirely despite the rules remaining decodable in their hidden states. When evaluating foundation models for deep, long-horizon agentic workflows, look closely at their residual propagation efficiency rather than just their single-turn benchmark scores.
+- **Two channels carry the goal.** Instruction information reaches later tokens both
+  through *attention* (later tokens attending back to the system-prompt tokens) and
+  through the *residual stream* (latent task representations written into hidden states).
+- **The attention channel can close.** As context grows, attention mass onto the
+  system-prompt tokens thins. The paper measures this with the **Goal Accessibility Ratio
+  (GAR)** — attention from generated tokens to goal tokens.
+- **What survives depends on the residual stream.** Force-closing the attention channel
+  (sliding-window ablation) collapses recall (in Mistral, from near-perfect to ~11% on a
+  20-fact task), yet **linear probes recover the goal from the residual stream with AUC up
+  to ~0.99** across architectures, while input embeddings stay at chance. Whether
+  goal-conditioned behavior survives the channel closing depends on the gap between
+  attention loss and residual decodability, and the encoding layer varies a lot by
+  architecture (the paper reports layers 2–27).
 
 ---
 
-### Conclusion: Closing the Gap
+## What this demo does
 
-For years, deploying LLMs into long, multi-turn applications felt like herding cats. You would patch a prompt to fix a bug at turn 5, only to watch the persona shatter entirely at turn 25.
+`demo.py` runs on `Qwen/Qwen2.5-0.5B-Instruct` via HuggingFace `transformers`
+(`attn_implementation="eager"` so attentions are exposed) on MPS or CPU. It plants a
+persona (`AUDITRON`) plus four facts in a system prompt, then grows a meandering
+conversation and inspects the internals. Every run logs its measurements to an embedded
+MongoDB store (smongo) so results accumulate into a queryable experiment log (see
+[Why MongoDB, via smongo](#why-mongodb-via-smongo)).
 
-By mapping the mechanics of how attention closes and identifying the hidden strength of the residual stream, Dongre et al. have shifted the paradigm from mystery to mechanics. LLMs aren't too small or too forgetful to follow rules over long horizons. The issue is a structural communication breakdown between what they can *see* and what they *know*.
+```bash
+python3 demo.py gar       # GAR decay: attention to the system prompt thins as turns grow
+python3 demo.py ablate    # force-close the channel to system tokens -> recall collapses
+python3 demo.py probe     # the planted value survives in the residual stream (high AUC)
+python3 demo.py all       # run all three (and log every measurement)
+python3 demo.py report    # aggregate stored runs via MongoDB pipelines (no model load)
+```
 
-The next generation of unbreakable, highly compliant AI agents won't be built on longer prompts—they will be built on architectures engineered to bridge the channel gap.
+- **`gar`** — appends a fact question at growing context lengths and reports GAR (attention
+  mass onto the system-token span at the final position), split into *early* vs *late*
+  layers so the layer-dependence the paper describes is visible. GAR trends down as the
+  context grows; the sweep runs out to several thousand tokens and grades recall across all
+  four facts, so you can see the first natural recall MISS appear once attention has thinned.
+  GAR is measured memory-safely (a primed KV cache + a single final-token forward) so the
+  long contexts don't materialize an O(L^2) attention matrix per layer.
+- **`ablate`** — greedy-generates twice per question: normally, and with an additive
+  attention mask that closes the channel from every post-system token onto the
+  system-token span. The mask deliberately leaves the system tokens' own causal
+  self-attention intact (masking *all* rows would produce an all-`-inf` row and a softmax
+  NaN), so any recall collapse is attributable to blinding the model to its instructions,
+  not to a numerical artifact. A runtime guard asserts the logits stay finite.
+- **`probe`** — trains a logistic-regression probe on hidden states. It varies the planted
+  codename across classes (`Halcyon` / `Borealis` / `Zephyr` / `Cinder`) in the *system
+  prompt*, while every episode ends with the *same* fixed question. Because the final-token
+  input is identical across classes, the input-embedding probe is a genuine chance
+  baseline; a high residual-stream AUC therefore means the model propagated the planted
+  value forward into its hidden state even after the attention channel thinned.
+- **`report`** — reads the embedded MongoDB store (no model load) and runs aggregation
+  pipelines: GAR decay range, the first recall MISS (crossover turn) per model, ablation
+  recall (shown as a per-fact rate, `ok/facts`, so it stays meaningful no matter how many
+  runs are in scope), and best residual vs embedding AUC. By default it scopes to the
+  **latest run per model**, so re-running `all` doesn't inflate or blend the numbers; pass
+  `--all-runs` to aggregate the full history or `--run <run_id>` for a single run. Re-run
+  `all` with different `--model` values and the report still aggregates across models.
 
-------
+```bash
+python3 demo.py report               # latest run per model (default)
+python3 demo.py report --all-runs     # full accumulated history
+python3 demo.py report --run <run_id> # a single run
+```
 
-## Appendix: Technical Addenda & Production Realities
+Logging is **best-effort**: if the metrics store can't be opened or a write fails, the
+science modes (`gar`/`ablate`/`probe`) still run and print their results — they just warn
+that the measurement wasn't logged. `report` is the only mode that needs the store.
 
-### 1. Clarifying "Context Hydration"
+See [SAMPLE_OUTPUT.md](SAMPLE_OUTPUT.md) for a captured run, including the `report` output.
 
-To ensure absolute clarity in your context management strategy, it helps to distinguish prompt reinjection from context hydration:
+---
 
-* **Dynamic System Prompt Reinjection:** Repasting the literal, raw system instructions into the chat log at fixed intervals.
-* **Context Hydration:** The practice of programmatically injecting compressed state summaries, key-value pairs of resolved user intent, or relevant semantic embeddings fetched from an external cache directly into the active context window—essentially "rewriting" a dense, synthesized history rather than forcing the model to re-read thousands of tokens of raw, meandering conversation.
+## What this demonstrates — and what it does not
 
-### 2. Addressing the Trade-off Elephant: The Cost of GAR and Probing
+**It does demonstrate (qualitatively):**
 
-While monitoring the **Goal Accessibility Ratio (GAR)** and running **linear probes** provides unprecedented visibility, any experienced ML engineer will immediately ask: *What is the tax on my inference pipeline?*
+- GAR decays as context grows (the attention channel closing), and at long context a
+  *natural* recall MISS eventually appears — though on a 0.5B model this is sparse and
+  non-monotonic (recall can recover at still-longer context).
+- Closing the channel to the system tokens degrades fact recall relative to the
+  unmodified model on the same prompts (the clean, total collapse).
+- The planted value is decodable from the residual stream well above the input-embedding
+  baseline — i.e. the information survives the channel thinning.
 
-Inspecting attention matrices to calculate GAR and pulling activations out of hidden layers for linear probing introduces measurable compute and latency overhead. Running these checks on every single token generation inside a production loop is a non-starter for low-latency applications.
+**It does not claim:**
 
-To balance architectural safety with production performance, teams should adopt a **sampled or tiered telemetry strategy**:
+- To reproduce the paper's absolute numbers. This is a single 0.5B model with home-grown
+  prompts and a tiny probe set; the paper uses multiple architectures, larger fact sets,
+  and proper statistical treatment.
+- That the ablation is the paper's exact sliding-window procedure. It is a simpler
+  whole-span column mask that captures the same idea (generated tokens can no longer see
+  goal tokens).
+- A causal claim about *production* behavior. The probe shows decodability, not that a
+  given deployment will or won't break at a particular turn.
 
-| Monitoring Strategy | Description | Latency Impact | Best Used For |
-| --- | --- | --- | --- |
-| **Gated Auditing** | Run GAR calculations only after the conversation crosses known "danger zones" (e.g., every 5 turns, or after 4,000 tokens). | Minimal / Cyclical | Standard multi-turn chatbots. |
-| **Parallel Probing** | Offload hidden-state tracking to an asynchronous background worker or a lightweight, distilled routing head. | Near-Zero (Off-path) | High-throughput, real-time voice or chat agents. |
-| **Canary Turn Testing** | Inject synthetic "compliance checks" into the user queue to test if the persona is slipping, rather than reading the internal layers directly. | Minimal | Cost-sensitive enterprise applications. |
+---
 
-By treating safety telemetry as a configurable sampling rate rather than an all-or-nothing inline process, you can maintain a sub-second response time while ensuring your agent’s "eye" never slips closed.
+## Why MongoDB, via smongo
+
+The paper's framing is that GAR is a **diagnostic you monitor** — so it is natural to keep the
+measurements rather than print and discard them. Each run writes one small document per data
+point (a GAR row, an ablation outcome, a probe AUC), and `report` runs MongoDB **aggregation
+pipelines** over the accumulated runs to answer questions you cannot get from a single stdout
+table, e.g. "the first crossover turn per model":
+
+```python
+coll.aggregate([
+    {"$match": {"mode": "gar", "recall_miss": True}},
+    {"$group": {"_id": "$model", "first_miss_turn": {"$min": "$turns"}}},
+])
+```
+
+A document store fits because each measurement is a small, schema-flexible record, and the
+analyses are naturally expressed as `$match` / `$group` pipelines.
+
+[`smongo`](https://pypi.org/project/smongo/) is used instead of a server because it is an
+**embedded, local-first MongoDB engine** (built on redb + Rust): same document model, same
+MongoDB Query Language, same wire protocol, but **no `mongod`, no Docker, no network** — just a
+file on disk via a `local://` URI. That keeps the project a single `python3 demo.py` away from
+running while still using a genuine MongoDB-compatible engine with full aggregation (and even
+`$vectorSearch`, unused here).
+
+Honest caveats: smongo is **beta**, ships a **compiled Rust extension**, and requires
+**Python >=3.11** (it pulls in `pymongo`). The store lives at `local://lost_track_db` by
+default (git-ignored); override with `--db`, which also accepts a normal
+`mongodb://`/Atlas URI if you would rather point at a real server.
+
+---
+
+## Install and run
+
+Requires **Python >=3.11** (a smongo constraint).
+
+```bash
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+
+python3 demo.py all       # runs the three modes and logs to local://lost_track_db
+python3 demo.py report    # aggregate the stored runs
+```
+
+First run downloads the model (~1 GB). It runs on Apple Silicon (MPS) or CPU; no GPU
+required. A different model can be supplied with `--model`, e.g.:
+
+```bash
+python3 demo.py probe --model Qwen/Qwen2.5-1.5B-Instruct
+```
+
+The metrics store defaults to `local://lost_track_db` (git-ignored); override with `--db`.
+
+### Tests
+
+`test_demo.py` is a fast, model-free smoke test (no model download, no inference) covering the
+GAR helper on synthetic attention tensors, the ablation-mask invariants (no all-`-inf` rows,
+finite softmax, correct columns masked), and the MongoDB crossover aggregation against a
+seeded temporary store:
+
+```bash
+python3 test_demo.py          # or: pytest test_demo.py
+```
+
+---
+
+## Notes and caveats
+
+- **GAR aggregation.** GAR here averages attention mass over heads per layer. The demo
+  reports early/late-layer splits, but a single scalar still blurs head- and layer-level
+  structure that the paper treats more carefully.
+- **Probe size.** The probe uses a small synthetic set (4 codename values × 8 filler
+  variations). AUC is informative about the *shape* (residual ≫ embedding) but is not a
+  statistically rigorous estimate.
+- **Practical takeaways** such as monitoring a GAR-like signal, periodically re-injecting
+  the system prompt, or selecting models by long-horizon behavior follow naturally from
+  the paper's framing, but they are engineering hypotheses — this repo does not evaluate
+  them.
+
+---
+
+## Appendix: possible future improvements
+
+This demo is intentionally a faithful reproduction-in-miniature, not a full replication. The
+items below would move it closer to the paper; they are grouped by whether the value is worth
+the added complexity and risk on a laptop-scale, single-small-model setup.
+
+### Worth doing (feasible, value > risk)
+
+- **Larger / strict-match probe set.** Grow beyond 4 codename values × 8 filler variations
+  and add held-out paraphrases of the probe question, so the residual AUC is a more
+  statistically meaningful estimate rather than just the right *shape*.
+- **Per-fact GAR vs per-fact recall.** Measure GAR at each of the four probe positions (not
+  only the codename probe) and correlate each fact's GAR with its own recall, tightening the
+  link the narrative draws between attention thinning and the observed MISS.
+
+### Worth doing carefully (frame honestly)
+
+- **Cross-model comparison (now partly enabled).** Because every run is logged to MongoDB and
+  `report` aggregates *per model*, running `demo.py all --model <A>` then `--model <B>` already
+  produces a side-by-side GAR / crossover / recall / AUC comparison. A dedicated `--compare`
+  view would just format this more nicely. Caveat unchanged: small models may not exhibit the
+  *contrasting* failure mode, so this stays descriptive, not a reproduction of the
+  architectural-divergence result.
+- **Longer / cleaner behavioral failure curve.** MODE 1 currently shows a single, noisy
+  natural MISS at ~4.6k tokens. Averaging over several filler orderings per length (and
+  reporting a recall rate, not a single 0/1 outcome) would smooth the curve and make the
+  GAR-to-failure relationship more convincing — at the cost of more compute.
+
+### Probably not worth it on this scale (risk > value)
+
+- **Claiming the cross-architecture *divergence* finding.** This is the paper's central
+  contribution and needs multiple model families chosen to contrast; asserting it from one or
+  two small models invites cherry-picking.
+- **Parametric crossover-turn / failure-timing prediction.** Fitting *when* a model fails is
+  fragile on a single 0.5B model and would mostly capture noise.
+- **True sliding-window ablation + persona-violation metrics.** The whole-span mask already
+  proves the causal point, and grading persona drift on a small model is subjective; both add
+  code surface for little incremental evidence unless the project pivots toward a benchmark.
+
+---
+
+## License
+
+See [LICENSE](LICENSE).
