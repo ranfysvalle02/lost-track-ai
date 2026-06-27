@@ -25,11 +25,15 @@ from datetime import datetime, timedelta, timezone
 import torch
 
 from demo import (
+    GAR_SCHEDULE,
     NEG,
     build_ablation_mask,
+    classify_reliance,
+    compare_by_model,
     crossover_by_model,
     gar_from_attentions,
     gar_per_layer,
+    gar_schedule,
     latest_run_ids,
     log_metric,
     open_metrics,
@@ -170,6 +174,60 @@ def test_log_metric_is_best_effort() -> None:
 
     log_metric(_Boom(), {"run_id": "r"}, {"mode": "gar", "turns": 8})  # must not raise
     log_metric(None, {"run_id": "r"}, {"mode": "gar"})  # None coll is a no-op
+
+
+def test_gar_schedule_caps_by_model_size() -> None:
+    # Small models get the full sweep; larger ones are capped so eager-attention prefill
+    # stays in memory. An explicit max_turns always wins.
+    assert gar_schedule(0.5e9) == GAR_SCHEDULE
+    assert gar_schedule(1.1e9)[-1] == 56, gar_schedule(1.1e9)
+    assert gar_schedule(1.7e9)[-1] == 24, gar_schedule(1.7e9)
+    assert gar_schedule(1.7e9, max_turns=160) == GAR_SCHEDULE
+    assert gar_schedule(0.5e9, max_turns=8) == (0, 8)
+    # Never empty, even for an absurdly low cap.
+    assert gar_schedule(0.5e9, max_turns=0) == (0,)
+
+
+def test_classify_reliance_buckets() -> None:
+    # Goal not decodable -> weak-encoding regardless of survival.
+    assert classify_reliance(0.55, 1.0) == "weak-encoding"
+    assert classify_reliance(None, None) == "weak-encoding"
+    # Decodable + recall holds under closure -> residual-reliant (robust).
+    assert classify_reliance(0.99, 1.0) == "residual-reliant"
+    assert classify_reliance(0.99, 0.50) == "residual-reliant"
+    # Decodable but no closure evidence -> residual-reliant by default.
+    assert classify_reliance(0.99, None) == "residual-reliant"
+    # Decodable but recall collapses under closure -> the dissociation.
+    assert classify_reliance(0.99, 0.0) == "attention-reliant"
+    assert classify_reliance(0.99, 0.49) == "attention-reliant"
+
+
+def test_compare_dissociation() -> None:
+    # Two synthetic models with identical residual decodability but opposite behavior under
+    # attention closure: R keeps recall (residual-reliant), F collapses (attention-reliant).
+    tmp = tempfile.mkdtemp()
+    try:
+        coll = open_metrics("local://" + os.path.join(tmp, "db"))
+        docs = []
+        for model, ablated_ok in (("R", 1), ("F", 0)):
+            # Probe: residual highly decodable, embedding at chance.
+            docs.append({"model": model, "mode": "probe", "repr": "residual", "auc": 0.99})
+            docs.append({"model": model, "mode": "probe", "repr": "embedding", "auc": 0.50})
+            # Ablation: both recall all 4 facts normally; only R survives closure.
+            for fact in ("a", "b", "c", "d"):
+                docs.append({"model": model, "mode": "ablate", "fact": fact,
+                             "normal_ok": 1, "ablated_ok": ablated_ok})
+        coll.insert_many(docs)
+
+        rows = {r["model"]: r for r in compare_by_model(coll)}
+        assert set(rows) == {"R", "F"}, rows
+        assert abs(rows["R"]["residual_auc"] - 0.99) < 1e-9
+        assert rows["R"]["survival"] == 1.0, rows["R"]
+        assert rows["F"]["survival"] == 0.0, rows["F"]
+        assert rows["R"]["reliance"] == "residual-reliant", rows["R"]
+        assert rows["F"]["reliance"] == "attention-reliant", rows["F"]
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def _run_all() -> None:

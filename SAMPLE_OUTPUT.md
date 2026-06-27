@@ -98,6 +98,44 @@ history instead (here, two runs -> `facts | 8`), while the rates and min/max GAR
 stable; `--run <run_id>` scopes to a single run. Re-running with `--model <other>` makes the
 report aggregate across models.
 
+## `compare` mode (cross-architecture dissociation)
+
+After logging several models (`demo.py all --model <name>`, using `--max-turns` to cap the
+sweep for larger ones), `python3 demo.py compare` lines up each model's dissociation
+signature. Captured across three ungated small models:
+
+```text
+========================================================================
+  COMPARE: cross-architecture dissociation (residual survival vs behavior)
+========================================================================
+  scope: latest run per model (use --all-runs for full history)
+  3 model(s): SmolLM2-360M-Instruct, Qwen2.5-0.5B-Instruct, TinyLlama-1.1B-Chat-v1.0
+
+                     model | res AUC | emb AUC | normal |  ablat |  surv |  miss@ |          reliance
+  ----------------------------------------------------------------------------------------------------
+     SmolLM2-360M-Instruct |   0.990 |   0.500 |   1.00 |   0.00 |  0.00 |      0 | attention-reliant
+     Qwen2.5-0.5B-Instruct |   1.000 |   0.500 |   1.00 |   0.00 |  0.00 |    128 | attention-reliant
+  TinyLlama-1.1B-Chat-v1.0 |   1.000 |   0.500 |   1.00 |   0.00 |  0.00 |      0 | attention-reliant
+
+  Reading it:
+    - residual-reliant : goal decodable AND recall survives closure (robust).
+    - attention-reliant: goal decodable BUT recall collapses under closure
+                         (info present, unused without attention — the dissociation).
+    - weak-encoding    : goal not decodable from the residual stream.
+
+  Caveat: small instruct models, a single run each, 4 planted facts and a 32-sample
+  probe. This shows the *shape* of the dissociation, not the paper's statistically
+  treated cross-architecture result.
+```
+
+**Honest result:** all three small models are `attention-reliant` — the goal is decodable from
+the residual stream (AUC ~0.99–1.0) yet recall collapses when attention to it is closed. The
+harness produces the per-model signature and the dissociation buckets correctly, but the
+architectural *divergence* the paper reports does not appear at this scale. That negative is
+reported as-is. (The added models use a capped GAR sweep via `--max-turns 24` so eager-attention
+prefill stays in memory; the reliance call is driven by the ablation/probe axes, not sweep
+depth.)
+
 ## How to read it
 
 - **GAR decay, then a behavioral MISS.** `GAR all` drops from 0.58 to ~0.33 as the
@@ -121,17 +159,21 @@ report aggregate across models.
   input.
 
 The model-free smoke test (`python3 test_demo.py`) covers the GAR math, the ablation-mask
-invariants, the MongoDB crossover aggregation and latest-run scoping (against seeded temp
-stores), and that logging is best-effort — all without any download or inference.
+invariants, the memory-aware GAR-sweep cap, the MongoDB crossover aggregation and latest-run
+scoping, the cross-architecture dissociation/classifier (against seeded temp stores), and
+that logging is best-effort — all without any download or inference.
 ```text
 [warn] metric not logged: disk on fire
 ok  test_ablation_mask_has_no_all_inf_rows
 ok  test_ablation_mask_shape_and_columns
+ok  test_classify_reliance_buckets
+ok  test_compare_dissociation
 ok  test_crossover_by_model_aggregation
 ok  test_gar_per_layer_matches_hand_calc
+ok  test_gar_schedule_caps_by_model_size
 ok  test_gar_tracks_span_mass
 ok  test_log_metric_is_best_effort
 ok  test_report_scope_latest_run
 
-7 passed
+10 passed
 ```

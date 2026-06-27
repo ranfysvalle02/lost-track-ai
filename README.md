@@ -50,6 +50,7 @@ python3 demo.py ablate    # force-close the channel to system tokens -> recall c
 python3 demo.py probe     # the planted value survives in the residual stream (high AUC)
 python3 demo.py all       # run all three (and log every measurement)
 python3 demo.py report    # aggregate stored runs via MongoDB pipelines (no model load)
+python3 demo.py compare   # cross-architecture dissociation across logged models (no model load)
 ```
 
 - **`gar`** — appends a fact question at growing context lengths and reports GAR (attention
@@ -57,8 +58,11 @@ python3 demo.py report    # aggregate stored runs via MongoDB pipelines (no mode
   layers so the layer-dependence the paper describes is visible. GAR trends down as the
   context grows; the sweep runs out to several thousand tokens and grades recall across all
   four facts, so you can see the first natural recall MISS appear once attention has thinned.
-  GAR is measured memory-safely (a primed KV cache + a single final-token forward) so the
-  long contexts don't materialize an O(L^2) attention matrix per layer.
+  GAR itself is measured memory-safely (a primed KV cache + a single final-token forward),
+  but the recall generations still prefill the full context under `eager` attention
+  (O(heads * L^2)). To stay within memory the sweep length is **capped by model size**
+  (sub-1B models get the full sweep; larger ones are shortened), overridable with
+  `--max-turns N`.
 - **`ablate`** — greedy-generates twice per question: normally, and with an additive
   attention mask that closes the channel from every post-system token onto the
   system-token span. The mask deliberately leaves the system tokens' own causal
@@ -85,11 +89,39 @@ python3 demo.py report --all-runs     # full accumulated history
 python3 demo.py report --run <run_id> # a single run
 ```
 
+- **`compare`** — reads the store (no model load) and lines up each logged model's
+  *dissociation signature*: residual-probe AUC (is the goal still decodable?) against
+  ablation survival `ablated/normal` and the crossover turn (does behavior survive when the
+  attention channel is force-closed?). Each model is bucketed as `residual-reliant` (decodable
+  and robust), `attention-reliant` (decodable but recall collapses under closure — the paper's
+  dissociation), or `weak-encoding` (not decodable). Honors `--all-runs` / `--run`.
+
 Logging is **best-effort**: if the metrics store can't be opened or a write fails, the
 science modes (`gar`/`ablate`/`probe`) still run and print their results — they just warn
-that the measurement wasn't logged. `report` is the only mode that needs the store.
+that the measurement wasn't logged. `report` and `compare` are the only modes that need the store.
 
-See [SAMPLE_OUTPUT.md](SAMPLE_OUTPUT.md) for a captured run, including the `report` output.
+### Cross-architecture comparison (descriptive)
+
+The paper's headline is a *cross-architecture dissociation* — "what survives reveals
+architecture." You can push toward it by logging several models and comparing:
+
+```bash
+python3 demo.py all --model Qwen/Qwen2.5-0.5B-Instruct
+python3 demo.py all --model HuggingFaceTB/SmolLM2-360M-Instruct --max-turns 24
+python3 demo.py all --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --max-turns 24
+python3 demo.py compare
+```
+
+These three ungated small models all expose `eager` attentions and support a system role
+(the demo skips a model whose chat template rejects a system message). In practice, at this
+scale all three land in the **same `attention-reliant` bucket** — the goal is decodable from
+the residual stream (AUC ~0.99–1.0) yet recall collapses when attention to it is closed. So
+the harness reproduces the *method and the per-model signature*, but **not** the architectural
+*divergence* itself: that needs larger, deliberately contrasting families and statistical
+treatment. This is reported honestly rather than dressed up as a contrast.
+
+See [SAMPLE_OUTPUT.md](SAMPLE_OUTPUT.md) for a captured run, including the `report` and
+`compare` output.
 
 ---
 
@@ -216,12 +248,12 @@ the added complexity and risk on a laptop-scale, single-small-model setup.
 
 ### Worth doing carefully (frame honestly)
 
-- **Cross-model comparison (now partly enabled).** Because every run is logged to MongoDB and
-  `report` aggregates *per model*, running `demo.py all --model <A>` then `--model <B>` already
-  produces a side-by-side GAR / crossover / recall / AUC comparison. A dedicated `--compare`
-  view would just format this more nicely. Caveat unchanged: small models may not exhibit the
-  *contrasting* failure mode, so this stays descriptive, not a reproduction of the
-  architectural-divergence result.
+- **Cross-model comparison (now implemented, descriptively).** `demo.py compare` lines up each
+  logged model's dissociation signature (residual AUC vs ablation survival vs crossover) and
+  buckets it as residual-/attention-reliant or weak-encoding. As shipped, the three sampled
+  small models all came out `attention-reliant` — so this is a working harness and an honest
+  per-model signature, not the *contrasting* failure mode. Getting an actual divergence would
+  need larger, deliberately chosen families (see below).
 - **Longer / cleaner behavioral failure curve.** MODE 1 currently shows a single, noisy
   natural MISS at ~4.6k tokens. Averaging over several filler orderings per length (and
   reporting a recall rate, not a single 0/1 outcome) would smooth the curve and make the

@@ -112,6 +112,21 @@ class Model:
         )
         self.model.to(DEVICE).eval()
         self.n_layers = self.model.config.num_hidden_layers
+        self.n_params = sum(p.numel() for p in self.model.parameters())
+
+    def supports_system_role(self) -> bool:
+        """Whether the chat template accepts a `system` message. The demo plants the goal
+        in the system prompt and measures attention onto it, so a template that drops or
+        rejects the system role (e.g. Gemma folds it into the first user turn) cannot be
+        measured as-is and should be skipped rather than silently mis-spanned."""
+        try:
+            self.tok.apply_chat_template(
+                [{"role": "system", "content": "x"}, {"role": "user", "content": "y"}],
+                add_generation_prompt=True,
+            )
+            return True
+        except Exception:
+            return False
 
     def encode(self, messages: list[dict]) -> torch.Tensor:
         enc = self.tok.apply_chat_template(
@@ -120,9 +135,22 @@ class Model:
         return enc["input_ids"].to(DEVICE)
 
     def system_span(self, messages: list[dict]) -> slice:
-        """Token span covering just the system message, within the full encoding."""
+        """Token span covering just the system message, within the full encoding.
+
+        Different chat templates render the system block slightly differently (ChatML's
+        `<|im_start|>system ... <|im_end|>` vs Zephyr's `<|system|> ... </s>`), and token
+        boundaries can shift once later turns are appended. Rather than assume the
+        system-only encoding is an exact prefix of the full conversation, we take the
+        longest common token prefix of the two — that is exactly the leading run of tokens
+        owned by the system message under any template, and it is what GAR/ablation must
+        target as the goal span."""
+        full = self.encode_no_gen(messages)
         sys_only = self.encode_no_gen([messages[0]])
-        return slice(0, sys_only.shape[1])
+        k = 0
+        limit = min(sys_only.shape[1], full.shape[1])
+        while k < limit and full[0, k].item() == sys_only[0, k].item():
+            k += 1
+        return slice(0, k)
 
     def encode_no_gen(self, messages: list[dict]) -> torch.Tensor:
         enc = self.tok.apply_chat_template(
@@ -235,20 +263,45 @@ def log_metric(coll, run: dict, doc: dict) -> None:
         print(f"[warn] metric not logged: {e}", file=sys.stderr)
 
 
-def run_gar(m: "Model", coll=None, run: dict | None = None) -> None:
+# Full GAR sweep (filler turns). Recall generation does a prefill at the resulting context
+# length, and because we force `eager` attention (to read attentions) that prefill
+# materializes an O(heads * L^2) score tensor. That is fine for sub-1B models but OOMs a
+# larger one at multi-thousand-token context — so the schedule is capped by model size.
+GAR_SCHEDULE = (0, 8, 24, 56, 96, 128, 160)
+
+
+def gar_schedule(n_params: int, max_turns: int | None = None) -> tuple[int, ...]:
+    """Pick the GAR filler-turn schedule. An explicit `max_turns` wins; otherwise cap by
+    parameter count so eager-attention prefill stays within memory on larger models."""
+    if max_turns is None:
+        if n_params > 1.2e9:
+            max_turns = 24
+        elif n_params > 0.8e9:
+            max_turns = 56
+        else:
+            max_turns = GAR_SCHEDULE[-1]
+    return tuple(t for t in GAR_SCHEDULE if t <= max_turns) or (0,)
+
+
+def run_gar(m: "Model", coll=None, run: dict | None = None,
+            max_turns: int | None = None) -> None:
     run = run or {}
     print("\n" + "=" * 72)
     print("  MODE 1: GAR decay — attention thins, then recall finally breaks")
     print("=" * 72)
+    schedule = gar_schedule(m.n_params, max_turns)
+    if schedule[-1] < GAR_SCHEDULE[-1]:
+        print(f"  (context capped at {schedule[-1]} turns for a "
+              f"{m.n_params/1e6:.0f}M-param model to keep eager attention in memory; "
+              "override with --max-turns)")
     print(f"{'turns':>5} | {'ctx tok':>7} | {'GAR all':>8} | {'early':>7} | "
           f"{'late':>7} | {'recall':>6}")
     print("-" * 72)
 
-    # Sweep well past the paper's "relentless flurry": this model's recall is sticky, so
-    # the first natural MISS only shows up at long context. GAR is measured memory-safely
-    # at the final token (see Model.gar_last_token) so we can reach those lengths.
+    # Sweep the "relentless flurry": recall is sticky, so a natural MISS only shows up at
+    # long context. GAR is measured memory-safely at the final token (Model.gar_last_token).
     first_miss = None
-    for n_filler in (0, 8, 24, 56, 96, 128, 160):
+    for n_filler in schedule:
         msgs = build_conversation(n_filler)
         sys_span = m.system_span(msgs)
 
@@ -513,6 +566,85 @@ def best_residual_auc_by_model(coll, match: dict | None = None) -> list[dict]:
     ]))
 
 
+# Thresholds for the cross-architecture reliance call. Deliberately lenient and named so the
+# heuristic is explicit: "decodable" = the goal is recoverable from the residual stream at all;
+# "survives" = at least half of recall holds when the attention channel is force-closed.
+AUC_DECODABLE = 0.70
+SURVIVAL_OK = 0.50
+
+
+def classify_reliance(residual_auc: float | None, survival: float | None) -> str:
+    """Bucket a model by *what its behavior relies on* when attention to the goal closes:
+
+      - weak-encoding    : the goal is not even decodable from the residual stream.
+      - residual-reliant : goal decodable AND recall largely survives channel closure
+                           (the model reads the goal from the residual stream -> robust).
+      - attention-reliant: goal decodable BUT recall collapses under closure (the info is
+                           present yet the model can't use it without attention -> fragile).
+
+    The last case is the paper's striking dissociation: 'what survives reveals architecture'."""
+    if residual_auc is None or residual_auc < AUC_DECODABLE:
+        return "weak-encoding"
+    if survival is None:
+        return "residual-reliant"  # decodable, no closure evidence to the contrary
+    return "residual-reliant" if survival >= SURVIVAL_OK else "attention-reliant"
+
+
+def compare_by_model(coll, match: dict | None = None) -> list[dict]:
+    """Assemble the per-model dissociation signature by joining the existing aggregations in
+    Python (each pipeline stays simple and unit-testable). Returns one row per model with the
+    two axes that matter — residual decodability and behavioral survival under closure — plus
+    the reliance bucket from `classify_reliance`."""
+    auc = {}
+    for r in best_residual_auc_by_model(coll, match):
+        auc.setdefault(r["_id"]["model"], {})[r["_id"]["repr"]] = r["best_auc"]
+    ablate = {r["_id"]: r for r in ablation_rate_by_model(coll, match)}
+    cross = {r["_id"]: r for r in crossover_by_model(coll, match)}
+    gar = {r["_id"]: r for r in gar_range_by_model(coll, match)}
+
+    models = sorted(set(auc) | set(ablate) | set(cross) | set(gar))
+    rows = []
+    for name in models:
+        a = ablate.get(name)
+        normal_ok = a["normal_ok"] if a else 0
+        ablated_ok = a["ablated_ok"] if a else 0
+        facts = (a["facts"] if a else 0) or 0
+        survival = ablated_ok / normal_ok if normal_ok else None
+        residual_auc = auc.get(name, {}).get("residual")
+        rows.append({
+            "model": name,
+            "residual_auc": residual_auc,
+            "embedding_auc": auc.get(name, {}).get("embedding"),
+            "normal_rate": (normal_ok / facts) if facts else None,
+            "ablated_rate": (ablated_ok / facts) if facts else None,
+            "survival": survival,
+            "first_miss_turn": cross.get(name, {}).get("first_miss_turn"),
+            "min_gar": gar.get(name, {}).get("min_gar"),
+            "max_gar": gar.get(name, {}).get("max_gar"),
+            "reliance": classify_reliance(residual_auc, survival),
+        })
+    return rows
+
+
+def short_model(name: str) -> str:
+    """Display name without the org prefix (e.g. 'Qwen/Qwen2.5-0.5B-Instruct' -> the part
+    after the last '/'), so per-model tables line up regardless of the hub path length."""
+    return name.rsplit("/", 1)[-1]
+
+
+def resolve_scope(coll, scope: str = "latest", run_id: str | None = None) -> tuple[dict, str]:
+    """Turn a (scope, run_id) request into the `$match` filter every pipeline shares, plus a
+    human-readable label. Shared by `report` and `compare`."""
+    if scope == "run" and run_id:
+        # Accept a run_id prefix (the value printed after a run is truncated to 8 chars).
+        full = next((r for r in coll.distinct("run_id") if r.startswith(run_id)), run_id)
+        return {"run_id": full}, f"run {full[:8]}"
+    if scope == "all":
+        return {}, "all runs (full history)"
+    return ({"run_id": {"$in": latest_run_ids(coll)}},
+            "latest run per model (use --all-runs for full history)")
+
+
 def run_report(coll, scope: str = "latest", run_id: str | None = None) -> None:
     print("\n" + "=" * 72)
     print("  REPORT: MongoDB aggregations over stored runs")
@@ -525,84 +657,138 @@ def run_report(coll, scope: str = "latest", run_id: str | None = None) -> None:
         print("No runs logged yet. Run e.g. `python3 demo.py all` first.\n")
         return
 
-    # Resolve the scope into a $match filter that every pipeline shares.
-    if scope == "run" and run_id:
-        # Accept a run_id prefix (the value printed after a run is truncated to 8 chars).
-        full = next((r for r in coll.distinct("run_id") if r.startswith(run_id)), run_id)
-        match = {"run_id": full}
-        scope_label = f"run {full[:8]}"
-    elif scope == "all":
-        match = {}
-        scope_label = "all runs (full history)"
-    else:  # "latest"
-        match = {"run_id": {"$in": latest_run_ids(coll)}}
-        scope_label = "latest run per model (use --all-runs for full history)"
-
+    match, scope_label = resolve_scope(coll, scope, run_id)
     n = coll.count_documents(match)
     models = sorted(coll.distinct("model", match))
     print(f"  scope: {scope_label}")
     print(f"  {n} documents across {len(models)} model(s): {', '.join(models)}")
 
     print("\n  GAR decay (max -> min) and context reached:")
-    print(f"    {'model':>28} | {'max GAR':>8} | {'min GAR':>8} | {'max turns':>9}")
+    print(f"    {'model':>24} | {'max GAR':>8} | {'min GAR':>8} | {'max turns':>9}")
     for r in gar_range_by_model(coll, match):
-        print(f"    {r['_id']:>28} | {r['max_gar']:>8.4f} | {r['min_gar']:>8.4f} | "
+        print(f"    {short_model(r['_id']):>24} | {r['max_gar']:>8.4f} | {r['min_gar']:>8.4f} | "
               f"{r['max_turns']:>9}")
 
     print("\n  First recall MISS (crossover turn):")
     rows = crossover_by_model(coll, match)
     if rows:
-        print(f"    {'model':>28} | {'first miss turn':>15} | {'GAR there':>9}")
+        print(f"    {'model':>24} | {'first miss turn':>15} | {'GAR there':>9}")
         for r in rows:
-            print(f"    {r['_id']:>28} | {r['first_miss_turn']:>15} | "
+            print(f"    {short_model(r['_id']):>24} | {r['first_miss_turn']:>15} | "
                   f"{r['lowest_gar_seen']:>9.4f}")
     else:
         print("    (no natural recall MISS recorded in scope)")
 
     print("\n  Ablation recall (rate over facts, normal vs ablated):")
-    print(f"    {'model':>28} | {'normal':>8} | {'ablated':>8} | {'facts':>5}")
+    print(f"    {'model':>24} | {'normal':>8} | {'ablated':>8} | {'facts':>5}")
     for r in ablation_rate_by_model(coll, match):
         facts = r["facts"] or 1
-        print(f"    {r['_id']:>28} | {r['normal_ok'] / facts:>8.2f} | "
+        print(f"    {short_model(r['_id']):>24} | {r['normal_ok'] / facts:>8.2f} | "
               f"{r['ablated_ok'] / facts:>8.2f} | {r['facts']:>5}")
 
     print("\n  Best probe AUC (residual vs embedding baseline):")
-    print(f"    {'model':>28} | {'repr':>9} | {'best AUC':>8}")
+    print(f"    {'model':>24} | {'repr':>9} | {'best AUC':>8}")
     for r in best_residual_auc_by_model(coll, match):
-        print(f"    {r['_id']['model']:>28} | {r['_id']['repr']:>9} | {r['best_auc']:>8.3f}")
+        print(f"    {short_model(r['_id']['model']):>24} | {r['_id']['repr']:>9} | "
+              f"{r['best_auc']:>8.3f}")
+
+    comp_rows = compare_by_model(coll, match)
+    if len(comp_rows) > 1:
+        print("\n  Cross-architecture reliance (see `compare` for the full signature):")
+        print(f"    {'model':>24} | {'reliance':>17}")
+        for r in comp_rows:
+            print(f"    {short_model(r['model']):>24} | {r['reliance']:>17}")
     print()
+
+
+def run_compare(coll, scope: str = "latest", run_id: str | None = None) -> None:
+    """Cross-architecture view: line up each model's *dissociation signature* — does the goal
+    survive in the residual stream (probe AUC), and does behavior survive when the attention
+    channel to the goal is force-closed (ablation survival)? The paper's headline is that these
+    two can come apart differently by architecture. This is descriptive, not a replication."""
+    print("\n" + "=" * 72)
+    print("  COMPARE: cross-architecture dissociation (residual survival vs behavior)")
+    print("=" * 72)
+
+    if coll is None:
+        print("Metrics store unavailable — nothing to compare.\n")
+        return
+    if coll.count_documents({}) == 0:
+        print("No runs logged yet. Run e.g. `python3 demo.py all --model <name>` first.\n")
+        return
+
+    match, scope_label = resolve_scope(coll, scope, run_id)
+    rows = compare_by_model(coll, match)
+    print(f"  scope: {scope_label}")
+    print(f"  {len(rows)} model(s): {', '.join(short_model(r['model']) for r in rows)}")
+
+    def fmt(x, spec="6.3f"):
+        return format(x, spec) if x is not None else "  n/a"
+
+    print(f"\n  {'model':>24} | {'res AUC':>7} | {'emb AUC':>7} | {'normal':>6} | "
+          f"{'ablat':>6} | {'surv':>5} | {'miss@':>6} | {'reliance':>17}")
+    print("  " + "-" * 100)
+    for r in rows:
+        miss = r["first_miss_turn"] if r["first_miss_turn"] is not None else "none"
+        print(f"  {short_model(r['model']):>24} | {fmt(r['residual_auc']):>7} | "
+              f"{fmt(r['embedding_auc']):>7} | {fmt(r['normal_rate'], '6.2f'):>6} | "
+              f"{fmt(r['ablated_rate'], '6.2f'):>6} | {fmt(r['survival'], '5.2f'):>5} | "
+              f"{str(miss):>6} | {r['reliance']:>17}")
+
+    print("\n  Reading it:")
+    print("    - residual-reliant : goal decodable AND recall survives closure (robust).")
+    print("    - attention-reliant: goal decodable BUT recall collapses under closure")
+    print("                         (info present, unused without attention — the dissociation).")
+    print("    - weak-encoding    : goal not decodable from the residual stream.")
+
+    if len(rows) < 2:
+        print("\n  Only one model in scope — log another with `demo.py all --model <name>`")
+        print("  (e.g. SmolLM2-1.7B-Instruct, TinyLlama-1.1B-Chat-v1.0) to see a contrast.")
+
+    print("\n  Caveat: small instruct models, a single run each, 4 planted facts and a 32-sample")
+    print("  probe. This shows the *shape* of the dissociation, not the paper's statistically")
+    print("  treated cross-architecture result.\n")
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Attention-channel-closing demo")
-    ap.add_argument("mode", choices=["gar", "ablate", "probe", "all", "report"])
+    ap.add_argument("mode", choices=["gar", "ablate", "probe", "all", "report", "compare"])
     ap.add_argument("--model", default=MODEL_NAME)
     ap.add_argument("--db", default=DB_URI,
                     help="smongo URI for the metrics store (default: %(default)s)")
     ap.add_argument("--all-runs", action="store_true",
-                    help="report: aggregate full history instead of the latest run per model")
+                    help="report/compare: aggregate full history instead of the latest run per model")
     ap.add_argument("--run", default=None, metavar="RUN_ID",
-                    help="report: scope to a single run_id")
+                    help="report/compare: scope to a single run_id")
+    ap.add_argument("--max-turns", type=int, default=None, metavar="N",
+                    help="gar: cap the filler-turn sweep (default: auto by model size, to "
+                         "keep eager-attention prefill within memory)")
     args = ap.parse_args()
 
     # Opening the store is best-effort: if it fails, the scientific modes still run
-    # (they just won't log); only `report` truly needs it.
+    # (they just won't log); only `report`/`compare` truly need it.
     try:
         coll = open_metrics(args.db)
     except Exception as e:
         print(f"[warn] could not open metrics store {args.db}: {e}", file=sys.stderr)
         coll = None
 
-    # `report` only reads the store — no need to load the model.
-    if args.mode == "report":
+    # `report` and `compare` only read the store — no need to load the model.
+    if args.mode in ("report", "compare"):
         scope = "run" if args.run else ("all" if args.all_runs else "latest")
-        run_report(coll, scope=scope, run_id=args.run)
+        (run_report if args.mode == "report" else run_compare)(
+            coll, scope=scope, run_id=args.run)
         return
 
     run = new_run(args.model)
     m = Model(args.model)
+    if not m.supports_system_role():
+        print(f"[skip] {args.model}: its chat template does not accept a system role, so "
+              "the goal cannot be planted/measured in the system prompt. Try a model with "
+              "system-role support (e.g. Qwen2.5, SmolLM2, TinyLlama).", file=sys.stderr)
+        return
     if args.mode in ("gar", "all"):
-        run_gar(m, coll, run)
+        run_gar(m, coll, run, max_turns=args.max_turns)
     if args.mode in ("ablate", "all"):
         run_ablate(m, coll, run)
     if args.mode in ("probe", "all"):

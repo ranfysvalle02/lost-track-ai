@@ -170,6 +170,30 @@ the "monitor GAR and detect the crossover" idea concrete and queryable across ru
 default (`--all-runs` aggregates the full history), and logging is best-effort so a store
 failure never aborts a measurement.
 
+### 5. Cross-architecture comparison (descriptive) — `compare`
+
+The paper's headline is a **dissociation across architectures**: as attention to the goal
+closes, the residual stream may still encode the goal (high probe AUC) while *behavior* either
+holds (the model reads from the residual stream) or collapses (it cannot, despite the info
+being present). `demo.py compare` builds this 2-axis signature per logged model — residual
+decodability (`best_residual_auc_by_model`) against behavioral survival under closure
+(`ablated_ok/normal_ok`) — and buckets each model via `classify_reliance`:
+
+- `residual-reliant`  — goal decodable AND recall survives closure (robust).
+- `attention-reliant` — goal decodable BUT recall collapses under closure (the dissociation).
+- `weak-encoding`     — goal not decodable from the residual stream.
+
+Measured across three ungated small models (Qwen2.5-0.5B-Instruct, SmolLM2-360M-Instruct,
+TinyLlama-1.1B-Chat-v1.0), **all three landed in `attention-reliant`** (residual AUC ~0.99–1.0,
+ablation survival 0.00). So the demo reproduces the paper's *method and per-model signature* but
+**not the architectural divergence** itself — small instruct models behave alike here, and
+showing a genuine contrast would need larger, deliberately chosen families plus statistical
+treatment. The honest negative is the result; the harness is the deliverable.
+
+(Note: to keep `eager`-attention prefill in memory, the added models are run with a capped GAR
+sweep via `--max-turns`; this does not affect the ablation/probe axes that drive the reliance
+call.)
+
 ---
 
 ## Claim-by-claim correspondence
@@ -182,6 +206,7 @@ failure never aborts a measurement.
 | Goal information survives in the residual stream (high AUC) | Yes | residual AUC 0.990 / 1.000 |
 | Input embeddings stay at chance | Yes | embedding AUC 0.500 |
 | Encoding emerges at some depth (layers 2–27) | Partially | layer 2 = 0.500, layers 12/22 ≈ 0.99 on this model |
+| Cross-architecture *divergence* ("what survives reveals architecture") | Attempted, not observed | `compare` across 3 small models: all `attention-reliant` (residual AUC ~0.99–1.0, ablation survival 0.00) — no contrast at this scale |
 
 ---
 
@@ -190,10 +215,14 @@ failure never aborts a measurement.
 The demo reproduces the paper's *mechanisms and method*, not its full experimental scope.
 These parts of the paper are out of scope here:
 
-- **Cross-architecture comparison.** The paper's central narrative — "what survives reveals
-  architecture," with some models preserving behavior at vanishing attention and others
-  failing despite decodable residual info — requires multiple model families. The demo runs
-  one 0.5B model (`--model` lets you swap in others, but there is no comparative analysis).
+- **Cross-architecture *divergence* (attempted, not reproduced).** The paper's central
+  narrative — "what survives reveals architecture," with some models preserving behavior at
+  vanishing attention and others failing despite decodable residual info — requires multiple
+  model families. The demo now *attempts* this descriptively via `compare` (see below): it
+  lines up each model's signature and buckets it. Across three small ungated models
+  (Qwen2.5-0.5B, SmolLM2-360M, TinyLlama-1.1B) all three came out `attention-reliant`, so the
+  contrast the paper reports did **not** appear at this scale — which is reported as-is rather
+  than massaged into a divergence.
 - **Parametric failure-timing / crossover-turn prediction.** The paper predicts *when* a
   model will fail under windowed attention closure. The demo shows decay and collapse but
   does not fit or validate a timing model.
@@ -214,11 +243,13 @@ These parts of the paper are out of scope here:
 As a *reproduction-in-miniature*, the demo is faithful: each diagnostic uses the same
 operational definition as the paper, the residual probe is constructed so its baseline is a
 true chance baseline, and all three headline qualitative results come out in the expected
-direction — including the AUC ~0.99 figure and the layer-emergence pattern. As a *replication*
-in the strong sense, it is intentionally limited to one small model and makes no
-cross-architecture or timing claims, which the paper treats as its main contributions. The
-[README](README.md) states these limits explicitly, and [SAMPLE_OUTPUT.md](SAMPLE_OUTPUT.md)
-shows a full captured run.
+direction — including the AUC ~0.99 figure and the layer-emergence pattern. It now also
+*attempts* the cross-architecture comparison (`compare`) across three small models, but the
+divergence does not appear at this scale (all three are `attention-reliant`) — reported as a
+clean negative rather than a claim. As a *replication* in the strong sense it remains limited
+to small models and makes no architectural-divergence or failure-timing claims, which the
+paper treats as its main contributions. The [README](README.md) states these limits
+explicitly, and [SAMPLE_OUTPUT.md](SAMPLE_OUTPUT.md) shows a full captured run.
 
 ---
 
