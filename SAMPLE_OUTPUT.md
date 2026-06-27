@@ -42,16 +42,15 @@ at longer context) — MODE 2 forces the clean *causal* collapse via ablation.
     --------------------------------------------
     recall: normal 4/4 (100%)  ->  ablated 0/4 (0%)
 
-  graded closure (keep the first frac of the system prompt visible):
-     visible | sys masked | recall
-    --------------------------------
-        1.00 |          0 |    4/4
-        0.75 |         22 |    2/4
-        0.50 |         44 |    0/4
-        0.25 |         66 |    0/4
-    --------------------------------
-  survival under partial closure: 0.17 (2/12 recalled). Total closure collapses recall; how much
-  survives the *graded* closure is what separates architectures (see `compare`).
+  graded closure (avg over orders ('strided', 'suffix', 'prefix') x 3 filler seeds; recall as more of the system prompt is hidden):
+     visible |  strided |   suffix |   prefix |  mean
+    -----------------------------------------------------
+        0.75 |     0.50 |     0.50 |     0.08 |  0.36
+        0.50 |     0.25 |     0.00 |     0.17 |  0.14
+        0.25 |     0.00 |     0.00 |     0.00 |  0.00
+    -----------------------------------------------------
+  survival under partial closure: 0.17 (seed band [0.17, 0.17]). Total closure collapses recall;
+  how much survives the *graded* closure is what separates architectures (see `compare`).
 
 
 ========================================================================
@@ -113,25 +112,29 @@ report aggregate across models.
 
 After logging several models (`demo.py all --model <name>`, using `--max-turns` to cap the
 sweep for larger ones), `python3 demo.py compare` lines up each model's dissociation
-signature. Captured across three ungated small models:
+signature. Captured across four ungated models, including a deliberately different family
+(StableLM-2-1.6B):
 
 ```text
 ========================================================================
   COMPARE: cross-architecture dissociation (residual survival vs behavior)
 ========================================================================
   scope: latest run per model (use --all-runs for full history)
-  3 model(s): SmolLM2-360M-Instruct, Qwen2.5-0.5B-Instruct, TinyLlama-1.1B-Chat-v1.0
+  4 model(s): SmolLM2-360M-Instruct, Qwen2.5-0.5B-Instruct, TinyLlama-1.1B-Chat-v1.0, stablelm-2-1_6b-chat
 
-                     model | res AUC | emb AUC | normal |  ablat |  surv |  miss@ |          reliance
-  ----------------------------------------------------------------------------------------------------
-     SmolLM2-360M-Instruct |   0.990 |   0.500 |   1.00 |   0.00 |  0.08 |      0 | attention-reliant
-     Qwen2.5-0.5B-Instruct |   1.000 |   0.500 |   1.00 |   0.00 |  0.17 |    128 | attention-reliant
-  TinyLlama-1.1B-Chat-v1.0 |   1.000 |   0.500 |   1.00 |   0.00 |  0.17 |      0 | attention-reliant
+                     model | res AUC | emb AUC | normal |  ablat |  surv |   seed band |  miss@ |            reliance
+  --------------------------------------------------------------------------------------------------------------------
+     SmolLM2-360M-Instruct |   0.990 |   0.500 |   1.00 |   0.00 |  0.18 | [0.17,0.19] |      0 |   attention-reliant
+     Qwen2.5-0.5B-Instruct |   1.000 |   0.500 |   1.00 |   0.00 |  0.17 | [0.17,0.17] |    128 |   attention-reliant
+  TinyLlama-1.1B-Chat-v1.0 |   1.000 |   0.500 |   1.00 |   0.00 |  0.14 | [0.11,0.17] |      0 |   attention-reliant
+      stablelm-2-1_6b-chat |   1.000 |   0.500 |   1.00 |   0.00 |  0.16 | [0.14,0.19] |   none |   attention-reliant
 
   Reading it:
     - ablat = recall under TOTAL closure (system span fully blinded; ~0 by design).
-    - surv  = recall under GRADED closure (mean recall as more of the system prompt
-              is hidden) — the discriminating axis, since it lands anywhere in [0, 1].
+    - surv  = recall under GRADED closure (mean over mask orders x fractions x seeds,
+              as more of the system prompt is hidden) — the discriminating axis [0,1].
+    - seed band = [min,max] survival across filler seeds (is the figure stable?).
+    - '*' marks a bucket within 0.10 of the 0.50 survival threshold (borderline).
     - residual-reliant : goal decodable AND recall survives graded closure (robust).
     - attention-reliant: goal decodable BUT recall collapses under closure
                          (info present, unused without attention — the dissociation).
@@ -142,17 +145,22 @@ signature. Captured across three ungated small models:
   treated cross-architecture result.
 ```
 
-**Honest result:** the graded-closure survival is now a real, differentiated axis
-(SmolLM2-360M `0.08`, Qwen2.5-0.5B and TinyLlama-1.1B `0.17`) rather than being pinned at 0 by
-total ablation — yet all three still sit below the survival threshold and bucket as
-`attention-reliant`: the goal is decodable from the residual stream (AUC ~0.99–1.0) but recall
-falls away as attention to it is closed. The harness produces the per-model signature and the
-dissociation buckets correctly, and the survival axis genuinely discriminates, but no model
-*flips* into `residual-reliant`, so the architectural *divergence* the paper reports does not
-appear at this scale. That negative is reported as-is. (The added models use a capped GAR sweep
-via `--max-turns 24` so eager-attention prefill stays in memory; the reliance call is driven by
-the closure/probe axes, not sweep
-depth.)
+**Honest result:** the graded-closure survival is a real, differentiated, seed-stable axis
+(SmolLM2-360M `0.18`, Qwen2.5-0.5B `0.17`, StableLM-2-1.6B `0.16`, TinyLlama-1.1B `0.14`, bands
+within ~0.02–0.06) rather than being pinned at 0 by total ablation — yet all four still sit well
+below the survival threshold and bucket as `attention-reliant`: the goal is decodable from the
+residual stream (AUC ~0.99–1.0) but recall falls away as attention to it is closed. Adding a
+genuinely different architecture family (StableLM-2) did not flip the result. The harness
+produces the per-model signature and the dissociation buckets correctly, and the survival axis
+genuinely discriminates, but no model *flips* into `residual-reliant`, so the architectural
+*divergence* the paper reports does not appear at this scale. That negative is reported as-is.
+
+Adding StableLM-2 also caught a real trap: its chat template renders a *lone* system message to
+nothing, so the span detector first returned an empty system span — which would have made the
+ablation a silent no-op and reported a fake `survival` of 1.0 (a spurious "flip"). A span
+fallback plus a guard that skips any model whose goal span can't be located now prevent that.
+(StableLM-2 is run with `--max-turns 0` — a single short-context GAR point, hence `miss@ none` —
+so a 1.6B model stays in memory; the reliance call is driven by the closure/probe axes.)
 
 ## How to read it
 
@@ -166,10 +174,12 @@ depth.)
   token (`Model.gar_last_token`), so the sweep can reach multi-thousand-token context
   without materializing O(L^2) attention across all layers.
 - **Ablation.** With normal attention the model recalls every fact (4/4). *Total* closure
-  (whole system span masked) drops recall to 0/4. *Graded* closure — hiding a growing suffix
-  of the system prompt — traces the curve in between (4/4 -> 2/4 -> 0/4), and its mean recall
-  is the `survival` axis `compare` uses. Both runs complete with no NaN (the finite-logits
-  guard passed), so the collapse is the manipulation, not a numerical artifact.
+  (whole system span masked) drops recall to 0/4. *Graded* closure — hiding a fraction of the
+  system prompt — traces the curve in between, averaged over three mask orderings and three
+  filler seeds so the `survival` axis reflects the goal channel (not fact position) and comes
+  with a seed band. Its mean recall is the `survival` axis `compare` uses. Both runs complete
+  with no NaN (the finite-logits guard passed), so the collapse is the manipulation, not a
+  numerical artifact.
 - **Residual probe.** The planted codename is undecodable at layer 2 (AUC 0.500), then
   becomes almost perfectly decodable by layers 12 and 22 (0.990 / 1.000), while the
   input-embedding baseline stays at chance (0.500) because the final-token input is
@@ -192,8 +202,9 @@ ok  test_gar_per_layer_matches_hand_calc
 ok  test_gar_schedule_caps_by_model_size
 ok  test_gar_tracks_span_mass
 ok  test_log_metric_is_best_effort
-ok  test_partial_ablation_mask_grades_between_baseline_and_total
+ok  test_partial_ablation_mask_endpoints_match_for_every_order
+ok  test_partial_ablation_mask_order_chooses_which_columns_survive
 ok  test_report_scope_latest_run
 
-11 passed
+12 passed
 ```

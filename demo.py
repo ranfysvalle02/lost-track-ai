@@ -101,14 +101,26 @@ PROBES = [
 ]
 
 
+def _common_prefix_len(a: list[int], b: list[int]) -> int:
+    """Length of the longest shared leading run of two token-id lists."""
+    k = 0
+    limit = min(len(a), len(b))
+    while k < limit and a[k] == b[k]:
+        k += 1
+    return k
+
+
 class Model:
     """Thin wrapper exposing tokenization, generation, attentions and hidden states."""
 
     def __init__(self, name: str = MODEL_NAME):
         print(f"loading {name} on {DEVICE} ...", flush=True)
-        self.tok = AutoTokenizer.from_pretrained(name)
+        # trust_remote_code lets us load contrasting families whose tokenizer/model live in
+        # the repo (e.g. StableLM-2, InternLM2). This executes code from the model repo, so it
+        # is only appropriate for reputable, vetted repos like the ones this demo names.
+        self.tok = AutoTokenizer.from_pretrained(name, trust_remote_code=True)
         self.model = AutoModelForCausalLM.from_pretrained(
-            name, dtype=torch.float32, attn_implementation="eager"
+            name, dtype=torch.float32, attn_implementation="eager", trust_remote_code=True
         )
         self.model.to(DEVICE).eval()
         self.n_layers = self.model.config.num_hidden_layers
@@ -141,15 +153,23 @@ class Model:
         `<|im_start|>system ... <|im_end|>` vs Zephyr's `<|system|> ... </s>`), and token
         boundaries can shift once later turns are appended. Rather than assume the
         system-only encoding is an exact prefix of the full conversation, we take the
-        longest common token prefix of the two — that is exactly the leading run of tokens
-        owned by the system message under any template, and it is what GAR/ablation must
-        target as the goal span."""
-        full = self.encode_no_gen(messages)
-        sys_only = self.encode_no_gen([messages[0]])
-        k = 0
-        limit = min(sys_only.shape[1], full.shape[1])
-        while k < limit and full[0, k].item() == sys_only[0, k].item():
-            k += 1
+        longest common token prefix of the full encoding and a system-only encoding — that
+        leading run is the system block under any well-behaved template.
+
+        Some templates (e.g. StableLM-2) render a *lone* system message to nothing, which
+        would yield an empty span and silently turn the ablation into a no-op. For those we
+        fall back to diffing two conversations that share the system block but differ in the
+        first user turn: their common prefix is the system block plus the user-turn opener
+        (a few structural tokens), which still covers every goal token. A still-empty result
+        means the goal span can't be located for this model -> the caller should skip it."""
+        full = self.encode_no_gen(messages)[0].tolist()
+        sys_only = self.encode_no_gen([messages[0]])[0].tolist()
+        k = _common_prefix_len(full, sys_only)
+        if k > 0:
+            return slice(0, k)
+        a = self.encode_no_gen([messages[0], {"role": "user", "content": "A"}])[0].tolist()
+        b = self.encode_no_gen([messages[0], {"role": "user", "content": "BB CC"}])[0].tolist()
+        k = min(_common_prefix_len(a, b), _common_prefix_len(full, a))
         return slice(0, k)
 
     def encode_no_gen(self, messages: list[dict]) -> torch.Tensor:
@@ -348,9 +368,12 @@ def run_gar(m: "Model", coll=None, run: dict | None = None,
 # sweep. 1.0 == full baseline; lower values hide more of the goal. Survival is measured over
 # the partial closures (fraction < 1.0); total closure (0.0) is the separate MODE-2 baseline.
 CLOSURE_KEEP_FRACTIONS = (1.0, 0.75, 0.5, 0.25)
+# Which span columns to mask at a partial fraction. Averaging over all three removes the
+# positional bias of any single ordering (see build_partial_ablation_mask).
+CLOSURE_ORDERS = ("strided", "suffix", "prefix")
 
 
-def run_ablate(m: "Model", coll=None, run: dict | None = None) -> None:
+def run_ablate(m: "Model", coll=None, run: dict | None = None, seeds: int = 3) -> None:
     run = run or {}
     print("\n" + "=" * 72)
     print("  MODE 2: Ablation — close attention to system tokens, totally then gradually")
@@ -388,38 +411,61 @@ def run_ablate(m: "Model", coll=None, run: dict | None = None) -> None:
     print(f"    recall: normal {normal_hits}/{n} ({100*normal_hits/n:.0f}%)  ->  "
           f"ablated {ablated_hits}/{n} ({100*ablated_hits/n:.0f}%)")
 
-    # Graded closure: hide a growing suffix of the system span. Facts that stay visible are
-    # recalled via attention; hidden facts can only be recovered from the residual stream —
-    # so recall here separates residual-reliant models (recall persists) from attention-
-    # reliant ones (recall collapses), and lands between full and zero.
-    sys_len = sys_span.stop - sys_span.start
-    print("\n  graded closure (keep the first frac of the system prompt visible):")
-    print(f"    {'visible':>8} | {'sys masked':>10} | {'recall':>6}")
-    print("    " + "-" * 32)
-    closing_hits = closing_total = 0
-    for frac in CLOSURE_KEEP_FRACTIONS:
-        hits = 0
-        masked = sys_len - round(frac * sys_len)
+    # Graded closure: hide a fraction of the system span. Facts that stay visible are recalled
+    # via attention; hidden facts can only be recovered from the residual stream — so recall
+    # here separates residual-reliant models (recall persists) from attention-reliant ones
+    # (recall collapses), and lands between full and zero. We average over mask orderings (so
+    # survival reflects the goal channel, not where a fact sits) and over `seeds` filler
+    # orderings (so it is a band, not a single draw). The filler `start` rotation is free.
+    partial = [f for f in CLOSURE_KEEP_FRACTIONS if f < 1.0]
+    grid: dict[tuple[str, float], list[int]] = {(o, f): [] for o in CLOSURE_ORDERS for f in partial}
+    seed_survival: list[float] = []
+    print(f"\n  graded closure (avg over orders {CLOSURE_ORDERS} x {seeds} filler seeds; "
+          "recall as more of the system prompt is hidden):")
+    for seed in range(seeds):
+        msgs_s = build_conversation(4, start=seed)
+        sys_span_s = m.system_span(msgs_s)
+        sys_len = sys_span_s.stop - sys_span_s.start
+        # Baseline (frac 1.0) is order-independent, so measure it once per seed.
         for fact_name, question in PROBES:
-            ids = m.encode(msgs + [{"role": "user", "content": question}])
-            reply = generate_partial_ablated(m, ids, sys_span, frac, max_new_tokens=30)
-            ok = FACTS[fact_name].lower() in reply.lower()
-            hits += ok
-            log_metric(coll, run, {
-                "mode": "closure", "fact": fact_name, "frac": frac,
-                "sys_masked": masked, "sys_len": sys_len, "recall_ok": int(ok),
-            })
-        if frac < 1.0:
-            closing_hits += hits
-            closing_total += len(PROBES)
-        print(f"    {frac:>8.2f} | {masked:>10} | {hits:>4}/{len(PROBES)}")
+            ids = m.encode(msgs_s + [{"role": "user", "content": question}])
+            ok = FACTS[fact_name].lower() in m.generate(ids, max_new_tokens=30).lower()
+            log_metric(coll, run, {"mode": "closure", "fact": fact_name, "frac": 1.0,
+                                   "order": "baseline", "seed": seed, "recall_ok": int(ok)})
+        seed_hits = seed_total = 0
+        for order in CLOSURE_ORDERS:
+            for frac in partial:
+                masked = sys_len - round(frac * sys_len)
+                for fact_name, question in PROBES:
+                    ids = m.encode(msgs_s + [{"role": "user", "content": question}])
+                    reply = generate_partial_ablated(m, ids, sys_span_s, frac, order,
+                                                     max_new_tokens=30)
+                    ok = int(FACTS[fact_name].lower() in reply.lower())
+                    grid[(order, frac)].append(ok)
+                    seed_hits += ok
+                    seed_total += 1
+                    log_metric(coll, run, {
+                        "mode": "closure", "fact": fact_name, "frac": frac, "order": order,
+                        "seed": seed, "sys_masked": masked, "sys_len": sys_len, "recall_ok": ok,
+                    })
+        seed_survival.append(seed_hits / seed_total if seed_total else 0.0)
 
-    survival = closing_hits / closing_total if closing_total else 0.0
-    print("    " + "-" * 32)
-    print(f"  survival under partial closure: {survival:.2f} "
-          f"({closing_hits}/{closing_total} recalled). Total closure collapses recall; how "
-          "much\n  survives the *graded* closure is what separates architectures (see "
-          "`compare`).\n")
+    # Compact curve: recall fraction per (visible fraction x order), averaged over seeds.
+    print(f"    {'visible':>8} | " + " | ".join(f"{o:>8}" for o in CLOSURE_ORDERS) + " | "
+          f"{'mean':>5}")
+    print("    " + "-" * (12 + 11 * len(CLOSURE_ORDERS) + 8))
+    for frac in partial:
+        cells = [sum(grid[(o, frac)]) / len(grid[(o, frac)]) for o in CLOSURE_ORDERS]
+        row_mean = sum(cells) / len(cells)
+        print(f"    {frac:>8.2f} | " + " | ".join(f"{c:>8.2f}" for c in cells) +
+              f" | {row_mean:>5.2f}")
+
+    survival = sum(seed_survival) / len(seed_survival) if seed_survival else 0.0
+    lo, hi = (min(seed_survival), max(seed_survival)) if seed_survival else (0.0, 0.0)
+    print("    " + "-" * (12 + 11 * len(CLOSURE_ORDERS) + 8))
+    print(f"  survival under partial closure: {survival:.2f} (seed band [{lo:.2f}, {hi:.2f}]). "
+          "Total closure collapses recall;\n  how much survives the *graded* closure is what "
+          "separates architectures (see `compare`).\n")
 
 
 def build_ablation_mask(L: int, sys_span: slice, device=None) -> torch.Tensor:
@@ -462,23 +508,44 @@ def generate_ablated(m: "Model", ids: torch.Tensor, sys_span: slice,
 
 
 def build_partial_ablation_mask(L: int, sys_span: slice, keep_frac: float,
-                                device=None) -> torch.Tensor:
+                                order: str = "strided", device=None) -> torch.Tensor:
     """Additive (1, 1, L, L) mask that *partially* closes the channel from post-system
-    tokens to the system span: it keeps the first `keep_frac` of the system-token columns
-    visible and masks the rest. This is the graded generalization of `build_ablation_mask`:
+    tokens to the system span: it keeps a `keep_frac` fraction of the system-token columns
+    visible to post-system rows and masks the rest. The graded generalization of
+    `build_ablation_mask`, with the endpoints identical for every `order`:
 
       - keep_frac == 1.0 -> mask nothing (plain causal baseline)
       - keep_frac == 0.0 -> mask the whole span (== build_ablation_mask, total closure)
 
-    Because the goal facts sit on separate lines in the system prompt, hiding a suffix of
-    the span leaves some facts attendable while others can only be recovered from the
-    residual stream — so recall here lands *between* full and zero, and how much survives
-    separates residual-reliant models from attention-reliant ones. Only post-system rows are
-    masked, so every row keeps its causal diagonal (no all -inf row, no softmax NaN)."""
+    `order` names *which* span columns are masked when 0 < keep_frac < 1 — the goal facts
+    sit on separate lines, so the choice of region biases which facts stay attendable. We
+    sweep all three and average so `survival` reflects the goal channel, not fact position:
+
+      - "suffix"  : mask the tail of the span (keep the head visible) — the original demo.
+      - "prefix"  : mask the head of the span (keep the tail visible).
+      - "strided" : mask an evenly-spaced subset (keep a strided subset visible) — least
+                    positionally biased, hence the default.
+
+    Only post-system rows are masked, so every row keeps its causal diagonal (no all -inf
+    row, no softmax NaN)."""
     mask = torch.full((L, L), NEG, device=device).triu(1)
     span = list(range(sys_span.start, sys_span.stop))
-    keep_n = round(keep_frac * len(span))
-    masked_cols = span[keep_n:]
+    span_len = len(span)
+    keep_n = round(keep_frac * span_len)
+    if keep_n <= 0:
+        kept: set[int] = set()
+    elif keep_n >= span_len:
+        kept = set(span)
+    elif order == "suffix":
+        kept = set(span[:keep_n])               # keep head, mask the suffix
+    elif order == "prefix":
+        kept = set(span[span_len - keep_n:])    # keep tail, mask the prefix
+    elif order == "strided":
+        pos = torch.linspace(0, span_len - 1, keep_n).round().long().tolist()
+        kept = {span[p] for p in pos}
+    else:
+        raise ValueError(f"unknown order {order!r} (use strided/suffix/prefix)")
+    masked_cols = [c for c in span if c not in kept]
     if masked_cols:
         mask[sys_span.stop:, masked_cols] = NEG
     return mask.view(1, 1, L, L)
@@ -486,13 +553,14 @@ def build_partial_ablation_mask(L: int, sys_span: slice, keep_frac: float,
 
 @torch.no_grad()
 def generate_partial_ablated(m: "Model", ids: torch.Tensor, sys_span: slice,
-                             keep_frac: float, max_new_tokens: int = 30) -> str:
-    """Greedy-generate while keeping only the first `keep_frac` of the system span visible to
+                             keep_frac: float, order: str = "strided",
+                             max_new_tokens: int = 30) -> str:
+    """Greedy-generate while keeping only a `keep_frac` fraction of the system span visible to
     post-system tokens at every step (see `build_partial_ablation_mask`)."""
     cur = ids
     for _ in range(max_new_tokens):
         L = cur.shape[1]
-        mask = build_partial_ablation_mask(L, sys_span, keep_frac, device=DEVICE)
+        mask = build_partial_ablation_mask(L, sys_span, keep_frac, order, device=DEVICE)
         logits = m.model(cur, attention_mask=mask).logits
         if not torch.isfinite(logits[0, -1]).all():
             raise RuntimeError("non-finite logits under the partial-ablation mask.")
@@ -649,24 +717,36 @@ def best_residual_auc_by_model(coll, match: dict | None = None) -> list[dict]:
 
 
 def closure_survival_by_model(coll, match: dict | None = None) -> list[dict]:
-    """Behavioral survival under the *graded* (partial) closure, per model: the mean recall
-    over the partial closures (fraction < 1.0, i.e. excluding the full-attention baseline).
-    This is the dissociation axis — a residual-reliant model keeps recalling as more of the
+    """Behavioral survival under the *graded* (partial) closure, per model: mean recall over
+    the partial closures (fraction < 1.0, i.e. excluding the full-attention baseline), with a
+    band across filler seeds. Survival is first averaged within each seed (over mask orders x
+    fractions x facts), then averaged across seeds — so the band's min/max are per-seed
+    survivals, showing whether the figure is a stable signal or a single-draw artifact.
+
+    This is the dissociation axis: a residual-reliant model keeps recalling as more of the
     system prompt is hidden, an attention-reliant one collapses. Unlike total ablation (which
-    pins recall at 0 for everyone), this lands between 0 and 1."""
+    pins recall at 0 for everyone) this lands between 0 and 1, and averaging over mask orders
+    de-confounds it from where a given fact happens to sit in the prompt."""
     return list(coll.aggregate([
         {"$match": {"mode": "closure", "frac": {"$lt": 1.0}, **(match or {})}},
-        {"$group": {"_id": "$model", "survival": {"$avg": "$recall_ok"},
-                    "steps": {"$sum": 1}}},
+        {"$group": {"_id": {"model": "$model", "seed": "$seed"},
+                    "seed_survival": {"$avg": "$recall_ok"}}},
+        {"$group": {"_id": "$_id.model", "survival": {"$avg": "$seed_survival"},
+                    "surv_min": {"$min": "$seed_survival"},
+                    "surv_max": {"$max": "$seed_survival"}, "seeds": {"$sum": 1}}},
         {"$sort": {"_id": 1}},
     ]))
 
 
 # Thresholds for the cross-architecture reliance call. Deliberately lenient and named so the
 # heuristic is explicit: "decodable" = the goal is recoverable from the residual stream at all;
-# "survives" = at least half of recall holds when the attention channel is force-closed.
+# "survives" = at least HALF of graded-closure recall holds (a natural midpoint: a model that
+# keeps >= 50% of its facts as the goal channel is progressively hidden is reading them from
+# the residual stream more than from attention). The bucket is a label on a continuous axis,
+# not a hard scientific claim, so `compare` also flags survivals that sit near the boundary.
 AUC_DECODABLE = 0.70
 SURVIVAL_OK = 0.50
+SURVIVAL_BORDERLINE = 0.10  # within this of SURVIVAL_OK -> the bucket is reported as borderline
 
 
 def classify_reliance(residual_auc: float | None, survival: float | None) -> str:
@@ -708,10 +788,12 @@ def compare_by_model(coll, match: dict | None = None) -> list[dict]:
         facts = (a["facts"] if a else 0) or 0
         # Prefer the graded partial-closure survival (lands in [0,1]); fall back to the
         # total-ablation ratio only when no graded sweep was logged.
-        if name in closure:
-            survival = closure[name]["survival"]
+        c = closure.get(name)
+        if c is not None:
+            survival, surv_min, surv_max = c["survival"], c.get("surv_min"), c.get("surv_max")
         else:
             survival = ablated_ok / normal_ok if normal_ok else None
+            surv_min = surv_max = None
         residual_auc = auc.get(name, {}).get("residual")
         rows.append({
             "model": name,
@@ -720,6 +802,8 @@ def compare_by_model(coll, match: dict | None = None) -> list[dict]:
             "normal_rate": (normal_ok / facts) if facts else None,
             "ablated_rate": (ablated_ok / facts) if facts else None,
             "survival": survival,
+            "surv_min": surv_min,
+            "surv_max": surv_max,
             "first_miss_turn": cross.get(name, {}).get("first_miss_turn"),
             "min_gar": gar.get(name, {}).get("min_gar"),
             "max_gar": gar.get(name, {}).get("max_gar"),
@@ -827,20 +911,35 @@ def run_compare(coll, scope: str = "latest", run_id: str | None = None) -> None:
     def fmt(x, spec="6.3f"):
         return format(x, spec) if x is not None else "  n/a"
 
+    def band(r):
+        lo, hi = r.get("surv_min"), r.get("surv_max")
+        return f"[{lo:.2f},{hi:.2f}]" if lo is not None and hi is not None else "    n/a "
+
+    def reliance_label(r):
+        s = r["survival"]
+        if s is not None and r["residual_auc"] is not None \
+                and r["residual_auc"] >= AUC_DECODABLE \
+                and abs(s - SURVIVAL_OK) <= SURVIVAL_BORDERLINE:
+            return r["reliance"] + " *"
+        return r["reliance"]
+
     print(f"\n  {'model':>24} | {'res AUC':>7} | {'emb AUC':>7} | {'normal':>6} | "
-          f"{'ablat':>6} | {'surv':>5} | {'miss@':>6} | {'reliance':>17}")
-    print("  " + "-" * 100)
+          f"{'ablat':>6} | {'surv':>5} | {'seed band':>11} | {'miss@':>6} | {'reliance':>19}")
+    print("  " + "-" * 116)
     for r in rows:
         miss = r["first_miss_turn"] if r["first_miss_turn"] is not None else "none"
         print(f"  {short_model(r['model']):>24} | {fmt(r['residual_auc']):>7} | "
               f"{fmt(r['embedding_auc']):>7} | {fmt(r['normal_rate'], '6.2f'):>6} | "
               f"{fmt(r['ablated_rate'], '6.2f'):>6} | {fmt(r['survival'], '5.2f'):>5} | "
-              f"{str(miss):>6} | {r['reliance']:>17}")
+              f"{band(r):>11} | {str(miss):>6} | {reliance_label(r):>19}")
 
     print("\n  Reading it:")
     print("    - ablat = recall under TOTAL closure (system span fully blinded; ~0 by design).")
-    print("    - surv  = recall under GRADED closure (mean recall as more of the system prompt")
-    print("              is hidden) — the discriminating axis, since it lands anywhere in [0, 1].")
+    print("    - surv  = recall under GRADED closure (mean over mask orders x fractions x seeds,")
+    print("              as more of the system prompt is hidden) — the discriminating axis [0,1].")
+    print("    - seed band = [min,max] survival across filler seeds (is the figure stable?).")
+    print(f"    - '*' marks a bucket within {SURVIVAL_BORDERLINE:.2f} of the {SURVIVAL_OK:.2f} "
+          "survival threshold (borderline).")
     print("    - residual-reliant : goal decodable AND recall survives graded closure (robust).")
     print("    - attention-reliant: goal decodable BUT recall collapses under closure")
     print("                         (info present, unused without attention — the dissociation).")
@@ -868,6 +967,9 @@ def main() -> None:
     ap.add_argument("--max-turns", type=int, default=None, metavar="N",
                     help="gar: cap the filler-turn sweep (default: auto by model size, to "
                          "keep eager-attention prefill within memory)")
+    ap.add_argument("--seeds", type=int, default=3, metavar="N",
+                    help="ablate: number of filler-ordering seeds for the graded-closure "
+                         "survival band (default: %(default)s)")
     args = ap.parse_args()
 
     # Opening the store is best-effort: if it fails, the scientific modes still run
@@ -892,10 +994,20 @@ def main() -> None:
               "the goal cannot be planted/measured in the system prompt. Try a model with "
               "system-role support (e.g. Qwen2.5, SmolLM2, TinyLlama).", file=sys.stderr)
         return
+    # Integrity guard: every measurement masks/measures the system span, so an empty span
+    # would silently turn ablation into a no-op and report fake survival. Refuse rather than
+    # mislead if the goal span can't be located for this model's chat template.
+    ref_span = m.system_span(build_conversation(4))
+    if ref_span.stop - ref_span.start == 0:
+        print(f"[skip] {args.model}: could not locate the system-prompt token span under "
+              "its chat template (goal span empty), so attention to the goal can't be "
+              "masked or measured. Skipping to avoid reporting a no-op as 'survival'.",
+              file=sys.stderr)
+        return
     if args.mode in ("gar", "all"):
         run_gar(m, coll, run, max_turns=args.max_turns)
     if args.mode in ("ablate", "all"):
-        run_ablate(m, coll, run)
+        run_ablate(m, coll, run, seeds=args.seeds)
     if args.mode in ("probe", "all"):
         run_probe(m, coll, run)
 

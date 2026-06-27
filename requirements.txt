@@ -8,3 +8,6 @@ scikit-learn>=1.3
 numpy>=1.24
 smongo>=1.2
 pymongo>=4.6
+# Optional: only needed for the contrasting `compare` model stabilityai/stablelm-2-1_6b-chat,
+# whose remote-code (Arcade100k) tokenizer uses tiktoken. The core demo does not require it.
+# tiktoken>=0.5

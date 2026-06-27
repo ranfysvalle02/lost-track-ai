@@ -186,23 +186,34 @@ decodability (`best_residual_auc_by_model`) against **graded-closure survival**
 The survival axis matters: an earlier version computed it from *total* ablation
 (`ablated_ok/normal_ok`), which masks the entire system span and therefore pins recall at 0 for
 every model — the axis could never discriminate. The demo now uses a **graded closure**: it
-hides a growing suffix of the system prompt (`build_partial_ablation_mask`, keeping the first
-75% / 50% / 25% visible) so some fact lines stay attendable while others survive only in the
-residual stream, and `survival` is the mean recall over those partial closures — a value that
-genuinely lands in [0, 1].
+hides a fraction of the system prompt (`build_partial_ablation_mask`, keeping 75% / 50% / 25%
+visible) so some facts stay attendable while others survive only in the residual stream. To
+avoid measuring the wrong thing it averages over three mask orderings (`strided` / `suffix` /
+`prefix`, so survival reflects the goal channel rather than where a fact sits) and over a few
+filler **seeds** (reported as a `[min,max]` band), and `survival` is the mean recall over those
+partial closures — a value that genuinely lands in [0, 1].
 
-Measured across three ungated small models, the survival axis is now real and differentiated —
-SmolLM2-360M 0.08, Qwen2.5-0.5B 0.17, TinyLlama-1.1B 0.17 — but **all three still fall below the
-survival threshold and land in `attention-reliant`** (residual AUC ~0.99–1.0). So the demo
-reproduces the paper's *method and per-model signature*, and the dissociation axis now
-discriminates rather than being degenerate, but it does **not** reproduce the architectural
-*divergence* itself: flipping a model to `residual-reliant` would need larger, deliberately
-chosen families plus statistical treatment. The honest negative is the result; the harness is
-the deliverable.
+Measured across four ungated models — including a deliberately different family, StableLM-2-1.6B
+— the survival axis is real, differentiated, and stable across seeds: SmolLM2-360M 0.18,
+Qwen2.5-0.5B 0.17, StableLM-2-1.6B 0.16, TinyLlama-1.1B 0.14 (bands within ~0.02–0.06). But
+**all four still fall well below the survival threshold and land in `attention-reliant`**
+(residual AUC ~0.99–1.0). So the demo reproduces the paper's *method and per-model signature*,
+de-confounded and with a contrasting architecture in the mix, but it does **not** reproduce the
+architectural *divergence* itself: flipping a model to `residual-reliant` would need larger,
+deliberately chosen families plus statistical treatment. The honest negative is the result; the
+harness is the deliverable.
+
+Integrity note: adding StableLM-2 surfaced a real trap. Its chat template renders a *lone*
+system message to nothing, so the longest-common-prefix span detector returned an empty system
+span — which would have made the ablation a silent no-op and reported a fake `survival` of 1.0
+(a spurious "flip"). The fix is a span fallback (diff two conversations that share the system
+block but differ in the first user turn) plus a guard that **skips any model whose goal span
+can't be located**, so the dissociation axis can never be faked by a measurement that closed
+nothing.
 
 (Note: to keep `eager`-attention prefill in memory, the added models are run with a capped GAR
-sweep via `--max-turns`; this does not affect the closure/probe axes that drive the reliance
-call.)
+sweep via `--max-turns` — StableLM-2 with `--max-turns 0`, a single short-context point; this
+does not affect the closure/probe axes that drive the reliance call.)
 
 ---
 
@@ -216,7 +227,7 @@ call.)
 | Goal information survives in the residual stream (high AUC) | Yes | residual AUC 0.990 / 1.000 |
 | Input embeddings stay at chance | Yes | embedding AUC 0.500 |
 | Encoding emerges at some depth (layers 2–27) | Partially | layer 2 = 0.500, layers 12/22 ≈ 0.99 on this model |
-| Cross-architecture *divergence* ("what survives reveals architecture") | Attempted, not observed | `compare` across 3 small models: graded-closure survival differs (0.08 / 0.17 / 0.17) but all stay `attention-reliant` (residual AUC ~0.99–1.0) — no flip at this scale |
+| Cross-architecture *divergence* ("what survives reveals architecture") | Attempted, not observed | `compare` across 4 models incl. a different family (StableLM-2): graded-closure survival differs (0.14–0.18, tight seed bands) but all stay `attention-reliant` (residual AUC ~0.99–1.0) — no flip at this scale |
 
 ---
 
@@ -229,11 +240,12 @@ These parts of the paper are out of scope here:
   narrative — "what survives reveals architecture," with some models preserving behavior at
   vanishing attention and others failing despite decodable residual info — requires multiple
   model families. The demo now *attempts* this descriptively via `compare` (see below) on a
-  graded-closure survival axis that genuinely discriminates (SmolLM2-360M 0.08 vs Qwen2.5-0.5B
-  / TinyLlama-1.1B 0.17). But all three still stay below the survival threshold and bucket as
-  `attention-reliant`, so the *flip* the paper reports — a model crossing into
-  `residual-reliant` — did **not** appear at this scale, which is reported as-is rather than
-  massaged into a divergence.
+  graded-closure survival axis that genuinely discriminates and is de-confounded across mask
+  orderings and seeds. Across four ungated models — including a deliberately different family,
+  StableLM-2-1.6B — survival lands at 0.14–0.18 with tight seed bands, but all four still stay
+  below the survival threshold and bucket as `attention-reliant`. So the *flip* the paper
+  reports — a model crossing into `residual-reliant` — did **not** appear at this scale, which
+  is reported as-is rather than massaged into a divergence.
 - **Parametric failure-timing / crossover-turn prediction.** The paper predicts *when* a
   model will fail under windowed attention closure. The demo shows decay and collapse but
   does not fit or validate a timing model.
@@ -256,11 +268,12 @@ As a *reproduction-in-miniature*, the demo is faithful: each diagnostic uses the
 operational definition as the paper, the residual probe is constructed so its baseline is a
 true chance baseline, and all three headline qualitative results come out in the expected
 direction — including the AUC ~0.99 figure and the layer-emergence pattern. It now also
-*attempts* the cross-architecture comparison (`compare`) across three small models, but the
-divergence does not appear at this scale (all three are `attention-reliant`) — reported as a
-clean negative rather than a claim. As a *replication* in the strong sense it remains limited
-to small models and makes no architectural-divergence or failure-timing claims, which the
-paper treats as its main contributions. The [README](README.md) states these limits
+*attempts* the cross-architecture comparison (`compare`) across four models including a
+deliberately different family (StableLM-2-1.6B), on a de-confounded, seed-banded survival axis,
+but the divergence does not appear at this scale (all four are `attention-reliant`) — reported
+as a clean negative rather than a claim. As a *replication* in the strong sense it remains
+limited to small models and makes no architectural-divergence or failure-timing claims, which
+the paper treats as its main contributions. The [README](README.md) states these limits
 explicitly, and [SAMPLE_OUTPUT.md](SAMPLE_OUTPUT.md) shows a full captured run.
 
 ---

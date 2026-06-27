@@ -106,26 +106,35 @@ def test_ablation_mask_has_no_all_inf_rows() -> None:
     assert torch.allclose(sums, torch.ones_like(sums), atol=1e-5), sums
 
 
-def test_partial_ablation_mask_grades_between_baseline_and_total() -> None:
+def test_partial_ablation_mask_endpoints_match_for_every_order() -> None:
     L, sys_span = 8, slice(0, 4)  # system span = cols 0..3, post-system rows = 4..7
-
-    # keep_frac == 1.0 -> nothing masked beyond causal (plain causal baseline).
-    full = build_partial_ablation_mask(L, sys_span, 1.0)[0, 0]
     causal = torch.full((L, L), NEG).triu(1)
-    assert torch.equal(full, causal)
+    total = build_ablation_mask(L, sys_span)[0, 0]
+    for order in ("strided", "suffix", "prefix"):
+        # keep_frac == 1.0 -> nothing masked beyond causal (plain causal baseline).
+        assert torch.equal(build_partial_ablation_mask(L, sys_span, 1.0, order)[0, 0], causal), order
+        # keep_frac == 0.0 -> whole span masked from post-system rows (== total ablation).
+        assert torch.equal(build_partial_ablation_mask(L, sys_span, 0.0, order)[0, 0], total), order
 
-    # keep_frac == 0.0 -> the whole span masked from post-system rows (== total ablation).
-    total = build_partial_ablation_mask(L, sys_span, 0.0)[0, 0]
-    assert torch.equal(total, build_ablation_mask(L, sys_span)[0, 0])
 
-    # keep_frac == 0.5 -> keep the first 2 span cols, mask cols 2,3 for post-system rows.
-    half = build_partial_ablation_mask(L, sys_span, 0.5)[0, 0]
-    for i in range(sys_span.stop, L):
-        assert half[i, 0].item() == 0.0 and half[i, 1].item() == 0.0, i  # kept
-        assert half[i, 2].item() == NEG and half[i, 3].item() == NEG, i  # masked
-        assert half[i, i].item() != NEG, i                               # diagonal kept
-    # No fully -inf row -> softmax stays finite.
-    assert torch.isfinite(torch.softmax(half, dim=-1)).all()
+def test_partial_ablation_mask_order_chooses_which_columns_survive() -> None:
+    L, sys_span = 8, slice(0, 4)  # span cols 0..3, keep_frac 0.5 -> keep 2, mask 2
+
+    def kept_cols(order):
+        m = build_partial_ablation_mask(L, sys_span, 0.5, order)[0, 0]
+        # A span col is "kept" if a post-system row can still attend to it.
+        return {c for c in range(sys_span.stop) if m[sys_span.stop, c].item() == 0.0}
+
+    assert kept_cols("suffix") == {0, 1}    # keep the head, mask the tail
+    assert kept_cols("prefix") == {2, 3}    # keep the tail, mask the head
+    assert kept_cols("strided") == {0, 3}   # evenly spaced (linspace(0,3,2) -> 0,3)
+
+    # Every order keeps each post-system row's diagonal -> no all -inf row -> finite softmax.
+    for order in ("strided", "suffix", "prefix"):
+        m = build_partial_ablation_mask(L, sys_span, 0.5, order)[0, 0]
+        for i in range(sys_span.stop, L):
+            assert m[i, i].item() != NEG, (order, i)
+        assert torch.isfinite(torch.softmax(m, dim=-1)).all(), order
 
 
 def test_crossover_by_model_aggregation() -> None:
@@ -226,40 +235,56 @@ def test_classify_reliance_buckets() -> None:
 
 
 def test_compare_dissociation() -> None:
-    # Two synthetic models with identical residual decodability but opposite behavior under
-    # the graded (partial) closure: R keeps recall as more of the system prompt is hidden
-    # (residual-reliant), F collapses (attention-reliant). Total ablation is 0 for both (by
-    # design), so the dissociation must come from the graded closure-survival axis.
+    # Synthetic models with identical residual decodability but different behavior under the
+    # graded (partial) closure. R keeps recall as more of the system prompt is hidden
+    # (residual-reliant), F collapses (attention-reliant); both are stable across seeds.
+    # V is seed-dependent (recalls on seed 0, fails on seed 1) so its survival is 0.5 with a
+    # wide [0,1] band — exercising the order/seed averaging and the min/max band.
     tmp = tempfile.mkdtemp()
+    orders = ("strided", "suffix", "prefix")
     try:
         coll = open_metrics("local://" + os.path.join(tmp, "db"))
         docs = []
-        for model, closing_ok in (("R", 1), ("F", 0)):
+
+        def closure_docs(model, recall_for_seed):
+            for seed in (0, 1):
+                for order in orders:
+                    for frac in (0.75, 0.5, 0.25):
+                        for fact in ("a", "b", "c", "d"):
+                            docs.append({"model": model, "mode": "closure", "fact": fact,
+                                         "frac": frac, "order": order, "seed": seed,
+                                         "recall_ok": recall_for_seed(seed)})
+                # frac == 1.0 baseline must be excluded from survival.
+                for fact in ("a", "b", "c", "d"):
+                    docs.append({"model": model, "mode": "closure", "fact": fact, "frac": 1.0,
+                                 "order": "baseline", "seed": seed, "recall_ok": 1})
+
+        for model in ("R", "F", "V"):
             docs.append({"model": model, "mode": "probe", "repr": "residual", "auc": 0.99})
             docs.append({"model": model, "mode": "probe", "repr": "embedding", "auc": 0.50})
             for fact in ("a", "b", "c", "d"):
-                # Total closure collapses recall for both.
                 docs.append({"model": model, "mode": "ablate", "fact": fact,
-                             "normal_ok": 1, "ablated_ok": 0})
-                # Graded closure: the full baseline recalls; partial closures separate the
-                # two models. frac == 1.0 must be excluded from survival.
-                docs.append({"model": model, "mode": "closure", "fact": fact,
-                             "frac": 1.0, "recall_ok": 1})
-                for frac in (0.75, 0.5, 0.25):
-                    docs.append({"model": model, "mode": "closure", "fact": fact,
-                                 "frac": frac, "recall_ok": closing_ok})
+                             "normal_ok": 1, "ablated_ok": 0})  # total closure: 0 for all
+        closure_docs("R", lambda s: 1)
+        closure_docs("F", lambda s: 0)
+        closure_docs("V", lambda s: 1 if s == 0 else 0)
         coll.insert_many(docs)
 
         rows = {r["model"]: r for r in compare_by_model(coll)}
-        assert set(rows) == {"R", "F"}, rows
+        assert set(rows) == {"R", "F", "V"}, rows
         assert abs(rows["R"]["residual_auc"] - 0.99) < 1e-9
-        # Survival is the mean recall over the partial closures (frac < 1.0), not the baseline.
-        assert rows["R"]["survival"] == 1.0, rows["R"]
-        assert rows["F"]["survival"] == 0.0, rows["F"]
-        # Total-ablation rate stays 0 for both (the old, degenerate axis).
+        # Survival = mean recall over partial closures (orders x fracs x seeds), not baseline.
+        assert rows["R"]["survival"] == 1.0 and rows["R"]["surv_min"] == 1.0, rows["R"]
+        assert rows["F"]["survival"] == 0.0 and rows["F"]["surv_max"] == 0.0, rows["F"]
+        # V: per-seed survival 1.0 / 0.0 -> mean 0.5, band spans [0, 1].
+        assert abs(rows["V"]["survival"] - 0.5) < 1e-9, rows["V"]
+        assert rows["V"]["surv_min"] == 0.0 and rows["V"]["surv_max"] == 1.0, rows["V"]
+        # Total-ablation rate stays 0 for all (the old, degenerate axis).
         assert rows["R"]["ablated_rate"] == 0.0, rows["R"]
         assert rows["R"]["reliance"] == "residual-reliant", rows["R"]
         assert rows["F"]["reliance"] == "attention-reliant", rows["F"]
+        # V sits exactly on the threshold -> residual-reliant (>=) and borderline.
+        assert rows["V"]["reliance"] == "residual-reliant", rows["V"]
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

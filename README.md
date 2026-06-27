@@ -65,13 +65,15 @@ python3 demo.py compare   # cross-architecture dissociation across logged models
   `--max-turns N`.
 - **`ablate`** — closes the channel from post-system tokens onto the system-token span in
   two regimes. **Total closure** masks the whole span (the clean causal collapse: recall
-  4/4 -> 0/4). **Graded closure** then hides a growing *suffix* of the system prompt
-  (keeping the first 75% / 50% / 25% visible) and measures recall at each step — so some
-  fact lines stay attendable while others can only be recovered from the residual stream.
-  The masks leave each row's causal diagonal intact (masking *all* rows would give an
-  all-`-inf` row and a softmax NaN), and a runtime guard asserts the logits stay finite.
-  The graded survival is the axis `compare` uses, because unlike total closure (0 for
-  everyone) it lands between 0 and 1.
+  4/4 -> 0/4). **Graded closure** then hides a fraction of the system prompt (keeping 75% /
+  50% / 25% visible) and measures recall at each step — so some facts stay attendable while
+  others can only be recovered from the residual stream. To keep `survival` honest it
+  **averages over three mask orderings** (`strided` / `suffix` / `prefix`, so the figure
+  reflects the goal channel, not where a fact happens to sit) and over **`--seeds N`** filler
+  orderings (default 3), reporting a `[min,max]` seed band. The masks leave each row's causal
+  diagonal intact (masking *all* rows would give an all-`-inf` row and a softmax NaN), and a
+  runtime guard asserts the logits stay finite. The graded survival is the axis `compare`
+  uses, because unlike total closure (0 for everyone) it lands between 0 and 1.
 - **`probe`** — trains a logistic-regression probe on hidden states. It varies the planted
   codename across classes (`Halcyon` / `Borealis` / `Zephyr` / `Cinder`) in the *system
   prompt*, while every episode ends with the *same* fixed question. Because the final-token
@@ -94,11 +96,12 @@ python3 demo.py report --run <run_id> # a single run
 
 - **`compare`** — reads the store (no model load) and lines up each logged model's
   *dissociation signature*: residual-probe AUC (is the goal still decodable?) against
-  **graded-closure survival** (mean recall as more of the system prompt is hidden — does
-  behavior survive when attention to the goal is progressively closed?). Each model is
-  bucketed as `residual-reliant` (decodable and survives closure), `attention-reliant`
-  (decodable but recall collapses under closure — the paper's dissociation), or
-  `weak-encoding` (not decodable). Honors `--all-runs` / `--run`.
+  **graded-closure survival** (order/seed-averaged recall as more of the system prompt is
+  hidden, with its seed band — does behavior survive when attention to the goal is
+  progressively closed?). Each model is bucketed as `residual-reliant` (decodable and
+  survives closure), `attention-reliant` (decodable but recall collapses under closure — the
+  paper's dissociation), or `weak-encoding` (not decodable); a `*` marks buckets within
+  `0.10` of the `0.50` survival threshold (borderline). Honors `--all-runs` / `--run`.
 
 Logging is **best-effort**: if the metrics store can't be opened or a write fails, the
 science modes (`gar`/`ablate`/`probe`) still run and print their results — they just warn
@@ -113,20 +116,29 @@ architecture." You can push toward it by logging several models and comparing:
 python3 demo.py all --model Qwen/Qwen2.5-0.5B-Instruct
 python3 demo.py all --model HuggingFaceTB/SmolLM2-360M-Instruct --max-turns 24
 python3 demo.py all --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --max-turns 24
+# A genuinely different family (StableLM-2). --max-turns 0 keeps the GAR sweep to one
+# short-context point so a 1.6B model stays in memory while ablate/probe (which drive the
+# reliance call) run normally. trust_remote_code is enabled in the loader for such repos.
+python3 demo.py all --model stabilityai/stablelm-2-1_6b-chat --max-turns 0
 python3 demo.py compare
 ```
 
-These three ungated small models all expose `eager` attentions and support a system role
-(the demo skips a model whose chat template rejects a system message). The graded-closure
-survival is a *real, differentiated* axis — e.g. SmolLM2-360M `0.08`, Qwen2.5-0.5B and
-TinyLlama-1.1B `0.17` — but at this scale all three still sit below the survival threshold
-and land in the **same `attention-reliant` bucket**: the goal is decodable from the residual
-stream (AUC ~0.99–1.0) yet recall falls away as attention to it is closed. So the harness
-reproduces the *method and the per-model signature* (and the survival axis now genuinely
-discriminates, rather than being pinned at 0 by total ablation), but **not** the architectural
-*divergence* itself: flipping a model into `residual-reliant` would need larger, deliberately
-contrasting families and statistical treatment. This is reported honestly rather than dressed
-up as a contrast.
+All four ungated models expose `eager` attentions and support a system role. The demo will
+**skip** a model whose chat template rejects a system message, *and* one whose system-prompt
+token span can't be located (an empty span would silently turn the ablation into a no-op and
+report fake "survival" — StableLM-2 actually tripped this, since its template renders a lone
+system message to nothing; the span detector now has a fallback and the run is guarded).
+
+The graded-closure survival is a *real, differentiated* axis with tight seed bands —
+SmolLM2-360M `0.18`, Qwen2.5-0.5B `0.17`, StableLM-2-1.6B `0.16`, TinyLlama-1.1B `0.14` — but
+at this scale all four still sit well below the survival threshold and land in the **same
+`attention-reliant` bucket**: the goal is decodable from the residual stream (AUC ~0.99–1.0)
+yet recall falls away as attention to it is closed. Adding a genuinely different architecture
+family (StableLM-2) did **not** flip the result. So the harness reproduces the *method and the
+per-model signature* (de-confounded across mask orderings and seeds, no longer pinned at 0 by
+total ablation), but **not** the architectural *divergence* itself: flipping a model into
+`residual-reliant` would need larger, deliberately contrasting families and statistical
+treatment. This is reported honestly rather than dressed up as a contrast.
 
 See [SAMPLE_OUTPUT.md](SAMPLE_OUTPUT.md) for a captured run, including the `report` and
 `compare` output.
