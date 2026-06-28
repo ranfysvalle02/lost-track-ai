@@ -5,6 +5,16 @@ the Thread in Multi-Turn Interaction"** (Dongre et al., [arXiv:2605.12922](https
 by reading model internals (attention matrices + hidden states) on small models — default
 `Qwen/Qwen2.5-0.5B-Instruct`, MPS/CPU, no GPU required.
 
+As a conversation grows, attention onto the original system-prompt tokens thins (GAR decay, 0.58 → 0.33), and that can produce behavioral failures: dropped constraints, broken persona, misremembered facts.  (It's token-volume/dilution, not "turns" per se. )
+
+The goal isn't gone, it's unused.
+
+That reframes the engineering question. If the information were genuinely lost, your only option would be to keep contexts short. But because it's present but unattended, the mechanism points at a cheaper class of fixes: re-route attention back to the goal rather than just truncate everything. Your three suggestions map onto this directly:
+
+Re-injecting the system prompt periodically — the most on-the-nose fix. It restates the goal near the current position, rebuilding the attention channel. This is essentially what steer does, but through the front door (prompt) instead of the residual stream.
+Summarization / compaction — helps because it keeps the goal proportionally closer and the context less diluted, so attention to what matters stays above the failure threshold.
+Memory / RAG — same principle: surface the relevant goal/facts at decision time, putting them back where attention can reach them.
+
 ## The one idea
 
 LLMs drift from their system prompt over long chats not because the goal is *gone*, but
